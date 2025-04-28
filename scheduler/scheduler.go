@@ -139,14 +139,20 @@ func (s *StreamScheduler) Start() error {
 		return fmt.Errorf("failed to create aacenc: %v", err)
 	}
 
-	// MPEG-TS muxer
+	// Add MPEG-TS muxer
 	mpegtsmux, err := gst.NewElement("mpegtsmux")
 	if err != nil {
 		return fmt.Errorf("failed to create mpegtsmux: %v", err)
 	}
 	mpegtsmux.SetProperty("name", "mux")
-
-	// Direct UDP sink instead of RTP
+	
+	// Add RTP payloader for MPEG-TS
+	rtpmp2tpay, err := gst.NewElement("rtpmp2tpay")
+	if err != nil {
+		return fmt.Errorf("failed to create rtpmp2tpay: %v", err)
+	}
+	
+	// UDP sink for RTP MPEG-TS
 	udpsink, err := gst.NewElement("udpsink")
 	if err != nil {
 		return fmt.Errorf("failed to create udpsink: %v", err)
@@ -168,11 +174,14 @@ func (s *StreamScheduler) Start() error {
 
 	aacenc.SetProperty("bitrate", 128000) // 128kbps audio
 
-	// Set UDP properties for multicast
+	// Configure RTP MPEG-TS payloader
+	rtpmp2tpay.SetProperty("pt", 33)  // Payload type for MPEG-TS
+	
+	// Set UDP properties for RTP MPEG-TS multicast
 	udpsink.SetProperty("host", s.host)
 	udpsink.SetProperty("port", s.port)
 	udpsink.SetProperty("auto-multicast", true)
-	udpsink.SetProperty("sync", true)             // Enable sync with clock
+	udpsink.SetProperty("sync", true)
 	udpsink.SetProperty("max-lateness", 10000000) // 10ms max lateness
 	udpsink.SetProperty("buffer-size", 2097152)   // 2MB buffer size
 
@@ -189,9 +198,10 @@ func (s *StreamScheduler) Start() error {
 	s.pipeline.Add(audiocaps)
 	s.pipeline.Add(aacenc)
 	s.pipeline.Add(mpegtsmux)
+	s.pipeline.Add(rtpmp2tpay)
 	s.pipeline.Add(udpsink)
 
-	// Link static elements for video path
+	// Link static elements for video path to muxer
 	s.vselector.Link(videoconv)
 	videoconv.Link(videoscale)
 	videoscale.Link(videocaps)
@@ -199,15 +209,16 @@ func (s *StreamScheduler) Start() error {
 	h264enc.Link(h264parse)
 	h264parse.Link(mpegtsmux)
 
-	// Link static elements for audio path
+	// Link static elements for audio path to muxer
 	s.aselector.Link(audioconv)
 	audioconv.Link(audioresample)
 	audioresample.Link(audiocaps)
 	audiocaps.Link(aacenc)
 	aacenc.Link(mpegtsmux)
 
-	// Link final elements - direct mpegts to udp
-	mpegtsmux.Link(udpsink)
+	// Link muxer to RTP payloader to UDP sink
+	mpegtsmux.Link(rtpmp2tpay)
+	rtpmp2tpay.Link(udpsink)
 
 	// Add pad probes to drop late buffers
 	vsrcpad := s.vselector.GetStaticPad("src")
@@ -264,7 +275,7 @@ func (s *StreamScheduler) Start() error {
 
 	// Start the pipeline
 	s.pipeline.SetState(gst.StatePlaying)
-	fmt.Printf("Pipeline is running. Streaming to RTP at %s:%d\n", s.host, s.port)
+	fmt.Printf("Pipeline is running. Streaming RTP MPEG-TS to %s:%d\n", s.host, s.port)
 
 	// Run the main loop in a separate goroutine
 	go s.mainLoop.Run()
@@ -274,80 +285,118 @@ func (s *StreamScheduler) Start() error {
 
 // addFileSource adds a file source to the pipeline
 func (s *StreamScheduler) addFileSource(index int, filePath string) error {
-	// Create video source
-	source, err := gst.NewElement("uridecodebin")
+	fmt.Printf("Adding file source for %s at index %d\n", filePath, index)
+	
+	// Instead of uridecodebin, let's use a more explicit pipeline for better control
+	filesrc, err := gst.NewElement("filesrc")
 	if err != nil {
-		return fmt.Errorf("failed to create source: %v", err)
+		return fmt.Errorf("failed to create filesrc: %v", err)
 	}
-	source.SetProperty("name", fmt.Sprintf("source%d", index))
-
+	filesrc.SetProperty("name", fmt.Sprintf("filesrc%d", index))
+	
 	// Make sure to handle relative paths
 	absPath, err := filepath.Abs(filePath)
 	if err != nil {
 		return fmt.Errorf("failed to get absolute path: %v", err)
 	}
-
-	source.SetProperty("uri", "file://"+absPath)
-
-	// Add to pipeline
-	s.pipeline.Add(source)
-
-	// Connect pad-added signal
-	source.Connect("pad-added", func(self *gst.Element, pad *gst.Pad) {
+	
+	filesrc.SetProperty("location", absPath)
+	filesrc.SetProperty("buffer-size", 10485760) // 10MB buffer
+	
+	// Add typefind to detect file type
+	typefind, err := gst.NewElement("typefind")
+	if err != nil {
+		return fmt.Errorf("failed to create typefind: %v", err)
+	}
+	
+	// Add decodebin to handle decoding
+	decodebin, err := gst.NewElement("decodebin")
+	if err != nil {
+		return fmt.Errorf("failed to create decodebin: %v", err)
+	}
+	decodebin.SetProperty("name", fmt.Sprintf("decode%d", index))
+	
+	// Add elements to pipeline
+	s.pipeline.Add(filesrc)
+	s.pipeline.Add(typefind)
+	s.pipeline.Add(decodebin)
+	
+	// Link filesrc -> typefind -> decodebin
+	filesrc.Link(typefind)
+	typefind.Link(decodebin)
+	
+	// Connect to typefind's "have-type" signal for debugging
+	typefind.Connect("have-type", func(self *gst.Element, probability uint, caps *gst.Caps) {
+		fmt.Printf("File type detected: %s (probability: %d)\n", caps.String(), probability)
+	})
+	
+	// Connect to decodebin's pad-added signal
+	decodebin.Connect("pad-added", func(self *gst.Element, pad *gst.Pad) {
 		caps := pad.CurrentCaps()
 		if caps == nil {
+			fmt.Printf("Warning: Pad has no caps\n")
 			return
 		}
-
+		
 		structure := caps.GetStructureAt(0)
 		if structure == nil {
+			fmt.Printf("Warning: Caps has no structure\n")
 			return
 		}
-
+		
 		name := structure.Name()
-
+		fmt.Printf("Decodebin pad added with caps: %s\n", caps.String())
+		
 		if len(name) >= 5 && name[:5] == "video" {
 			// Handle video pad
-			// Check if pad already exists to avoid duplicate pad warnings
 			padName := fmt.Sprintf("sink_%d", index)
-			sinkPad := s.vselector.GetStaticPad(padName)
+			sinkPad := s.vselector.GetRequestPad(padName)
 			if sinkPad == nil {
-				sinkPad = s.vselector.GetRequestPad(padName)
-				if sinkPad == nil {
-					fmt.Printf("Failed to get request video pad %s\n", padName)
-					return
-				}
-				pad.Link(sinkPad)
-				fmt.Printf("Linked video source%d to vselector.%s\n", index, padName)
-			} else {
-				// Pad already exists, use it without requesting a new one
-				pad.Link(sinkPad)
-				fmt.Printf("Linked video source%d to existing vselector.%s\n", index, padName)
+				fmt.Printf("Failed to get request video pad %s\n", padName)
+				return
 			}
+			
+			linkResult := pad.Link(sinkPad)
+			if linkResult != gst.PadLinkOK {
+				fmt.Printf("Video pad link failed: %v\n", linkResult)
+				return
+			}
+			fmt.Printf("Linked video decode%d to vselector.%s\n", index, padName)
+			
 		} else if len(name) >= 5 && name[:5] == "audio" {
 			// Handle audio pad
-			// Check if pad already exists to avoid duplicate pad warnings
 			padName := fmt.Sprintf("sink_%d", index)
-			sinkPad := s.aselector.GetStaticPad(padName)
+			sinkPad := s.aselector.GetRequestPad(padName)
 			if sinkPad == nil {
-				sinkPad = s.aselector.GetRequestPad(padName)
-				if sinkPad == nil {
-					fmt.Printf("Failed to get request audio pad %s\n", padName)
-					return
-				}
-				pad.Link(sinkPad)
-				fmt.Printf("Linked audio source%d to aselector.%s\n", index, padName)
-			} else {
-				// Pad already exists, use it without requesting a new one
-				pad.Link(sinkPad)
-				fmt.Printf("Linked audio source%d to existing aselector.%s\n", index, padName)
+				fmt.Printf("Failed to get request audio pad %s\n", padName)
+				return
 			}
+			
+			linkResult := pad.Link(sinkPad)
+			if linkResult != gst.PadLinkOK {
+				fmt.Printf("Audio pad link failed: %v\n", linkResult)
+				return
+			}
+			fmt.Printf("Linked audio decode%d to aselector.%s\n", index, padName)
+		} else {
+			fmt.Printf("Ignoring pad with caps: %s\n", caps.String())
 		}
 	})
-
-	// Store source for later reference
-	s.sources[index] = append(s.sources[index], source)
-
+	
+	// Connect to decodebin's no-more-pads signal for debugging
+	decodebin.Connect("no-more-pads", func(self *gst.Element) {
+		fmt.Printf("Decodebin has no more pads\n")
+	})
+	
+	// Connect to decodebin's autoplug-select signal to help with format selection
+	decodebin.Connect("autoplug-select", func(self *gst.Element, pad *gst.Pad, caps *gst.Caps, factory *gst.ElementFactory) int {
+		fmt.Printf("Autoplug select for %s: %s\n", factory.GetName(), caps.String())
+		return 0 // GST_AUTOPLUG_SELECT_TRY
+	})
+	
+	// Store sources for later reference
+	s.sources[index] = append(s.sources[index], filesrc, typefind, decodebin)
+	
 	return nil
 }
 
