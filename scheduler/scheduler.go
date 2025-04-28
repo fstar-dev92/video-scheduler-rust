@@ -98,8 +98,8 @@ func (s *StreamScheduler) Start() error {
 		return fmt.Errorf("failed to create videocaps: %v", err)
 	}
 
-	// Set video to 720p max resolution at 30fps
-	capstr := "video/x-raw,width=1280,height=720,framerate=30/1"
+	// Set video to 720p max resolution at 30fps with more flexible format settings
+	capstr := "video/x-raw,width=(int)[1,1920],height=(int)[1,1080],framerate=(fraction)[1/1,30/1]"
 	caps := gst.NewCapsFromString(capstr)
 	videocaps.SetProperty("caps", caps)
 
@@ -107,6 +107,12 @@ func (s *StreamScheduler) Start() error {
 	h264enc, err := gst.NewElement("x264enc")
 	if err != nil {
 		return fmt.Errorf("failed to create h264enc: %v", err)
+	}
+
+	// Add h264 parser to ensure proper stream formatting
+	h264parse, err := gst.NewElement("h264parse")
+	if err != nil {
+		return fmt.Errorf("failed to create h264parse: %v", err)
 	}
 
 	audioconv, err := gst.NewElement("audioconvert")
@@ -177,6 +183,7 @@ func (s *StreamScheduler) Start() error {
 	s.pipeline.Add(videoscale)
 	s.pipeline.Add(videocaps)
 	s.pipeline.Add(h264enc)
+	s.pipeline.Add(h264parse)
 	s.pipeline.Add(audioconv)
 	s.pipeline.Add(audioresample)
 	s.pipeline.Add(audiocaps)
@@ -189,7 +196,8 @@ func (s *StreamScheduler) Start() error {
 	videoconv.Link(videoscale)
 	videoscale.Link(videocaps)
 	videocaps.Link(h264enc)
-	h264enc.Link(mpegtsmux)
+	h264enc.Link(h264parse)
+	h264parse.Link(mpegtsmux)
 
 	// Link static elements for audio path
 	s.aselector.Link(audioconv)
@@ -212,6 +220,21 @@ func (s *StreamScheduler) Start() error {
 	asrcpad := s.aselector.GetStaticPad("src")
 	if asrcpad != nil {
 		asrcpad.AddProbe(gst.PadProbeTypeBuffer, func(pad *gst.Pad, info *gst.PadProbeInfo) gst.PadProbeReturn {
+			return gst.PadProbeOK
+		})
+	}
+
+	// Add pad probes to monitor caps negotiation
+	vsrcpad = s.vselector.GetStaticPad("src")
+	if vsrcpad != nil {
+		vsrcpad.AddProbe(gst.PadProbeTypeEventDownstream, func(pad *gst.Pad, info *gst.PadProbeInfo) gst.PadProbeReturn {
+			event := info.GetEvent()
+			if event != nil && event.Type() == gst.EventTypeCaps {
+				caps := event.ParseCaps()
+				if caps != nil {
+					fmt.Printf("Video caps from selector: %s\n", caps.String())
+				}
+			}
 			return gst.PadProbeOK
 		})
 	}
