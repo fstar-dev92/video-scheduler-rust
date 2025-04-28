@@ -8,9 +8,9 @@ import (
 	"syscall"
 	"time"
 
-	"scheduler-rtp/scheduler" // Import the local scheduler package
-
 	"github.com/go-gst/go-gst/gst"
+
+	"scheduler-rtp/scheduler"
 )
 
 func main() {
@@ -30,23 +30,16 @@ func main() {
 	// We'll schedule a test pattern for 10 seconds, then a file for 10 seconds, then back to test pattern
 	streamScheduler.AddItem(scheduler.StreamItem{
 		Type:     "file",
-		Source:   "input.mp4", // First video file
+		Source:   "videos/input.mp4", // First video file
 		Start:    now,
-		Duration: 100 * time.Second,
+		Duration: 10 * time.Second,
 	})
 
 	streamScheduler.AddItem(scheduler.StreamItem{
 		Type:     "file",
-		Source:   "input2.mp4", // Second video file
-		Start:    now.Add(100 * time.Second),
-		Duration: 100 * time.Second,
-	})
-
-	streamScheduler.AddItem(scheduler.StreamItem{
-		Type:     "file",
-		Source:   "input.mp4", // Back to first video
-		Start:    now.Add(200 * time.Second),
-		Duration: 100 * time.Second,
+		Source:   "videos/input2.mp4", // Second video file
+		Start:    now.Add(10 * time.Second),
+		Duration: 10 * time.Second,
 	})
 
 	// Start the scheduler
@@ -54,15 +47,14 @@ func main() {
 		log.Fatalf("Failed to start scheduler: %v", err)
 	}
 
-	// Direct RTP URL for VLC
-	fmt.Printf("To play in VLC: Open VLC and go to Media > Open Network Stream > enter rtp://@%s:%d\n",
+	// Direct UDP URL for VLC
+	fmt.Printf("To play in VLC: Open VLC and go to Media > Open Network Stream > enter udp://@%s:%d\n",
 		"239.1.1.2", 5000)
 
 	fmt.Println("Scheduler started. Press Ctrl+C to exit.")
 	fmt.Println("Schedule:")
-	fmt.Printf("0-100s: Test pattern\n")
-	fmt.Printf("100-200s: Test video\n")
-	fmt.Printf("200-300s: Test pattern\n")
+	fmt.Printf("0-10s: videos/input.mp4\n")
+	fmt.Printf("10-20s: videos/input2.mp4\n")
 
 	// Wait for interrupt signal
 	sigChan := make(chan os.Signal, 1)

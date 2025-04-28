@@ -2,110 +2,135 @@ package scheduler
 
 import (
 	"fmt"
-	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
+	"github.com/go-gst/go-glib/glib"
 	"github.com/go-gst/go-gst/gst"
 )
 
+// StreamItem represents a scheduled video item
 type StreamItem struct {
-	Type     string
-	Source   string
-	Start    time.Time
-	Duration time.Duration
+	Type     string        // "file" or "test" (test pattern)
+	Source   string        // File path for "file" type
+	Start    time.Time     // When to start playing this item
+	Duration time.Duration // How long to play this item
 }
 
+// StreamScheduler manages a GStreamer pipeline for scheduled playback
 type StreamScheduler struct {
-	pipeline     *gst.Pipeline
-	selector     *gst.Element
-	items        []StreamItem
-	mu           sync.Mutex
-	isRunning    bool
-	stopChan     chan struct{}
-	outputHost   string
-	outputPort   int
-	currentPad   *gst.Pad
-	nextPad      *gst.Pad
-	nextPipeline *gst.Pipeline
+	host      string
+	port      int
+	items     []StreamItem
+	pipeline  *gst.Pipeline
+	mainLoop  *glib.MainLoop
+	vselector *gst.Element
+	aselector *gst.Element
+	mutex     sync.Mutex
+	stopChan  chan struct{}
+	running   bool
+	sources   map[int][]*gst.Element // Track sources by index
 }
 
-func NewStreamScheduler(outputHost string, outputPort int) (*StreamScheduler, error) {
-	gst.Init(nil)
-
-	pipeline, err := gst.NewPipeline("")
-	if err != nil {
-		return nil, fmt.Errorf("failed to create pipeline: %v", err)
-	}
-
-	// Create input-selector element
-	selector, err := gst.NewElement("input-selector")
-	if err != nil {
-		return nil, fmt.Errorf("failed to create input-selector: %v", err)
-	}
-
-	// Set selector properties for smooth switching
-	selector.SetProperty("sync-streams", true)
-	selector.SetProperty("sync-mode", 1) // 1 = sync-streams mode
-
+// NewStreamScheduler creates a new stream scheduler
+func NewStreamScheduler(host string, port int) (*StreamScheduler, error) {
 	return &StreamScheduler{
-		pipeline:   pipeline,
-		selector:   selector,
-		stopChan:   make(chan struct{}),
-		outputHost: outputHost,
-		outputPort: outputPort,
+		host:     host,
+		port:     port,
+		items:    make([]StreamItem, 0),
+		stopChan: make(chan struct{}),
+		sources:  make(map[int][]*gst.Element),
 	}, nil
 }
 
+// AddItem adds a scheduled item to play
 func (s *StreamScheduler) AddItem(item StreamItem) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
 	s.items = append(s.items, item)
 }
 
-func (s *StreamScheduler) createInputBin(source string, isRTP bool) (*gst.Pipeline, error) {
-	var pipelineStr string
-	if isRTP {
-		pipelineStr = fmt.Sprintf(`
-            udpsrc uri=%s caps="application/x-rtp" !
-            rtpjitterbuffer !
-            rtph264depay !
-            h264parse !
-            avdec_h264 !
-            queue max-size-buffers=4 max-size-time=200000000 max-size-bytes=0 !
-            identity silent=false sync=true !
-            fakesink name=sink sync=true
-        `, source)
-	} else {
-		// For file source, use a pipeline that matches the gst-launch command
-		// but also includes a fakesink for the scheduler to work with
-		pipelineStr = fmt.Sprintf(`
-            filesrc location=%s !
-            decodebin !
-            videoconvert !
-            queue max-size-buffers=4 max-size-time=200000000 max-size-bytes=0 !
-            identity silent=false sync=true !
-            fakesink name=sink sync=true
-        `, source)
+// Start begins the scheduling and streaming
+func (s *StreamScheduler) Start() error {
+	s.mutex.Lock()
+	if s.running {
+		s.mutex.Unlock()
+		return fmt.Errorf("scheduler is already running")
+	}
+	s.running = true
+	s.mutex.Unlock()
+
+	// Create the pipeline
+	var err error
+	s.pipeline, err = gst.NewPipeline("streaming-pipeline")
+	if err != nil {
+		return fmt.Errorf("failed to create pipeline: %v", err)
 	}
 
-	// Create a pipeline for this input
-	pipeline, err := gst.NewPipelineFromString(pipelineStr)
+	// Create elements for output (RTP streaming)
+	s.vselector, err = gst.NewElement("input-selector")
 	if err != nil {
-		return nil, fmt.Errorf("failed to create input pipeline: %v", err)
+		return fmt.Errorf("failed to create vselector: %v", err)
+	}
+	s.vselector.SetProperty("name", "vselector")
+
+	s.aselector, err = gst.NewElement("input-selector")
+	if err != nil {
+		return fmt.Errorf("failed to create aselector: %v", err)
+	}
+	s.aselector.SetProperty("name", "aselector")
+
+	videoconv, err := gst.NewElement("videoconvert")
+	if err != nil {
+		return fmt.Errorf("failed to create videoconv: %v", err)
 	}
 
-	return pipeline, nil
-}
-
-func (s *StreamScheduler) setupMainPipeline() error {
-	// Create a simple pipeline that matches the gst-launch command:
-	// gst-launch-1.0 filesrc location=input.mp4 ! decodebin ! videoconvert ! x264enc ! mpegtsmux ! rtpmp2tpay ! udpsink host=239.1.1.2 port=5000 auto-multicast=true
-
-	// Video encoder
-	x264enc, err := gst.NewElement("x264enc")
+	// Add a videoscale element to handle resolution
+	videoscale, err := gst.NewElement("videoscale")
 	if err != nil {
-		return fmt.Errorf("failed to create x264enc: %v", err)
+		return fmt.Errorf("failed to create videoscale: %v", err)
+	}
+
+	// Add capsfilter to limit video size and framerate
+	videocaps, err := gst.NewElement("capsfilter")
+	if err != nil {
+		return fmt.Errorf("failed to create videocaps: %v", err)
+	}
+
+	// Set video to 720p max resolution at 30fps
+	capstr := "video/x-raw,width=1280,height=720,framerate=30/1"
+	caps := gst.NewCapsFromString(capstr)
+	videocaps.SetProperty("caps", caps)
+
+	// Change to h264 encoder with more compatible settings
+	h264enc, err := gst.NewElement("x264enc")
+	if err != nil {
+		return fmt.Errorf("failed to create h264enc: %v", err)
+	}
+
+	audioconv, err := gst.NewElement("audioconvert")
+	if err != nil {
+		return fmt.Errorf("failed to create audioconv: %v", err)
+	}
+
+	audioresample, err := gst.NewElement("audioresample")
+	if err != nil {
+		return fmt.Errorf("failed to create audioresample: %v", err)
+	}
+
+	// Add audio caps filter
+	audiocaps, err := gst.NewElement("capsfilter")
+	if err != nil {
+		return fmt.Errorf("failed to create audiocaps: %v", err)
+	}
+	audiocapsstr := "audio/x-raw,rate=44100,channels=2"
+	acaps := gst.NewCapsFromString(audiocapsstr)
+	audiocaps.SetProperty("caps", acaps)
+
+	aacenc, err := gst.NewElement("avenc_aac")
+	if err != nil {
+		return fmt.Errorf("failed to create aacenc: %v", err)
 	}
 
 	// MPEG-TS muxer
@@ -113,211 +138,274 @@ func (s *StreamScheduler) setupMainPipeline() error {
 	if err != nil {
 		return fmt.Errorf("failed to create mpegtsmux: %v", err)
 	}
+	mpegtsmux.SetProperty("name", "mux")
 
-	// RTP payloader for MPEG-TS
-	rtpmp2tpay, err := gst.NewElement("rtpmp2tpay")
-	if err != nil {
-		return fmt.Errorf("failed to create rtpmp2tpay: %v", err)
-	}
-
-	// UDP sink
+	// Direct UDP sink instead of RTP
 	udpsink, err := gst.NewElement("udpsink")
 	if err != nil {
 		return fmt.Errorf("failed to create udpsink: %v", err)
 	}
-	udpsink.SetProperty("host", s.outputHost)
-	udpsink.SetProperty("port", s.outputPort)
-	udpsink.SetProperty("auto-multicast", true)
 
-	// Add elements to main pipeline
-	s.pipeline.Add(s.selector)
-	s.pipeline.Add(x264enc)
+	// Set properties
+	s.vselector.SetProperty("sync-streams", true)
+	s.vselector.SetProperty("sync-mode", 1) // 1 = sync-to-clock
+	s.aselector.SetProperty("sync-streams", true)
+	s.aselector.SetProperty("sync-mode", 1)
+
+	// Configure H264 encoder for better compatibility and performance
+	h264enc.SetProperty("tune", "zerolatency")
+	h264enc.SetProperty("bitrate", 2000)             // Set bitrate to 2Mbps for better quality
+	h264enc.SetProperty("key-int-max", 30)           // Key frame every 30 frames
+	h264enc.SetProperty("byte-stream", true)         // Use byte stream format for NAL units
+	h264enc.SetProperty("speed-preset", "superfast") // Faster encoding
+	h264enc.SetProperty("threads", 4)                // Use 4 threads for encoding
+
+	aacenc.SetProperty("bitrate", 128000) // 128kbps audio
+
+	// Set UDP properties for multicast
+	udpsink.SetProperty("host", s.host)
+	udpsink.SetProperty("port", s.port)
+	udpsink.SetProperty("auto-multicast", true)
+	udpsink.SetProperty("sync", true)             // Enable sync with clock
+	udpsink.SetProperty("max-lateness", 10000000) // 10ms max lateness
+	udpsink.SetProperty("buffer-size", 2097152)   // 2MB buffer size
+
+	// Add elements to pipeline
+	s.pipeline.Add(s.vselector)
+	s.pipeline.Add(s.aselector)
+	s.pipeline.Add(videoconv)
+	s.pipeline.Add(videoscale)
+	s.pipeline.Add(videocaps)
+	s.pipeline.Add(h264enc)
+	s.pipeline.Add(audioconv)
+	s.pipeline.Add(audioresample)
+	s.pipeline.Add(audiocaps)
+	s.pipeline.Add(aacenc)
 	s.pipeline.Add(mpegtsmux)
-	s.pipeline.Add(rtpmp2tpay)
 	s.pipeline.Add(udpsink)
 
-	// Link elements
-	srcPad := s.selector.GetStaticPad("src")
-	if srcPad == nil {
-		return fmt.Errorf("failed to get src pad from selector")
+	// Link static elements for video path
+	s.vselector.Link(videoconv)
+	videoconv.Link(videoscale)
+	videoscale.Link(videocaps)
+	videocaps.Link(h264enc)
+	h264enc.Link(mpegtsmux)
+
+	// Link static elements for audio path
+	s.aselector.Link(audioconv)
+	audioconv.Link(audioresample)
+	audioresample.Link(audiocaps)
+	audiocaps.Link(aacenc)
+	aacenc.Link(mpegtsmux)
+
+	// Link final elements - direct mpegts to udp
+	mpegtsmux.Link(udpsink)
+
+	// Add pad probes to drop late buffers
+	vsrcpad := s.vselector.GetStaticPad("src")
+	if vsrcpad != nil {
+		vsrcpad.AddProbe(gst.PadProbeTypeBuffer, func(pad *gst.Pad, info *gst.PadProbeInfo) gst.PadProbeReturn {
+			return gst.PadProbeOK
+		})
 	}
 
-	sinkPad := x264enc.GetStaticPad("sink")
-	if sinkPad == nil {
-		return fmt.Errorf("failed to get sink pad from x264enc")
+	asrcpad := s.aselector.GetStaticPad("src")
+	if asrcpad != nil {
+		asrcpad.AddProbe(gst.PadProbeTypeBuffer, func(pad *gst.Pad, info *gst.PadProbeInfo) gst.PadProbeReturn {
+			return gst.PadProbeOK
+		})
 	}
 
-	// Link the selector to x264enc
-	ret := srcPad.Link(sinkPad)
-	if ret != 0 {
-		return fmt.Errorf("failed to link selector to x264enc: %v", ret)
-	}
+	// Create a main loop
+	s.mainLoop = glib.NewMainLoop(nil, false)
 
-	// Link the remaining elements
-	err = gst.ElementLinkMany(x264enc, mpegtsmux, rtpmp2tpay, udpsink)
-	if err != nil {
-		return fmt.Errorf("failed to link elements: %v", err)
-	}
+	// Create sources for each scheduled item
+	s.mutex.Lock()
+	items := make([]StreamItem, len(s.items))
+	copy(items, s.items)
+	s.mutex.Unlock()
 
-	// Print pipeline structure for debugging
-	fmt.Println("Pipeline structure:")
-	fmt.Println("selector -> x264enc -> mpegtsmux -> rtpmp2tpay -> udpsink")
-	fmt.Printf("Output: MPEG-TS over RTP to %s:%d\n", s.outputHost, s.outputPort)
-	fmt.Println("To play in VLC: Media > Open Network Stream > enter: rtp://@" + s.outputHost + ":" + fmt.Sprintf("%d", s.outputPort))
-	fmt.Println("To play with GStreamer: gst-launch-1.0 udpsrc address=" + s.outputHost + " port=" + fmt.Sprintf("%d", s.outputPort) +
-		" multicast-group=" + s.outputHost + " ! application/x-rtp,media=video,payload=33,clock-rate=90000,encoding-name=MP2T ! " +
-		"rtpmp2tdepay ! tsdemux ! h264parse ! avdec_h264 ! autovideosink")
-
-	return nil
-}
-
-func (s *StreamScheduler) prepareNextSource(item *StreamItem) error {
-	// Create input pipeline for the next source
-	inputPipeline, err := s.createInputBin(item.Source, item.Type == "rtp")
-	if err != nil {
-		return err
-	}
-
-	// Verify that the fakesink element exists
-	_, err = inputPipeline.GetElementByName("sink")
-	if err != nil {
-		return fmt.Errorf("failed to get fakesink element: %v", err)
-	}
-
-	// Get request pad from selector
-	selectorPad := s.selector.GetRequestPad("sink_%u")
-	if selectorPad == nil {
-		return fmt.Errorf("failed to get request pad from selector")
-	}
-
-	// Store the new pad
-	s.nextPad = selectorPad
-
-	// Start the input pipeline
-	inputPipeline.SetState(gst.StatePlaying)
-
-	// Store the pipeline in a field so it doesn't get garbage collected
-	s.nextPipeline = inputPipeline
-
-	return nil
-}
-
-func (s *StreamScheduler) switchToNextSource() {
-	if s.nextPad != nil {
-		// Switch selector to next pad
-		s.selector.SetProperty("active-pad", s.nextPad)
-
-		// Clean up old pad if exists
-		if s.currentPad != nil {
-			s.selector.ReleaseRequestPad(s.currentPad)
-		}
-
-		s.currentPad = s.nextPad
-		s.nextPad = nil
-	}
-}
-
-func (s *StreamScheduler) Start() error {
-	s.mu.Lock()
-	if s.isRunning {
-		s.mu.Unlock()
-		return fmt.Errorf("scheduler is already running")
-	}
-	s.isRunning = true
-	s.mu.Unlock()
-
-	if err := s.setupMainPipeline(); err != nil {
-		return err
-	}
-
-	// Set pipeline to playing
-	s.pipeline.SetState(gst.StatePlaying)
-
-	// Print the RTP URL for debugging
-	fmt.Printf("Streaming MPEG-TS over RTP to: rtp://%s:%d\n", s.outputHost, s.outputPort)
-	fmt.Println("To play in VLC: Media > Open Network Stream > enter: rtp://@" + s.outputHost + ":" + fmt.Sprintf("%d", s.outputPort))
-
-	go func() {
-		var currentItem *StreamItem
-		var nextItemPrepared bool
-
-		for {
-			select {
-			case <-s.stopChan:
-				s.pipeline.SetState(gst.StateNull)
-				return
-			default:
-				s.mu.Lock()
-				now := time.Now()
-
-				// Find current and next items
-				var activeItem, nextItem *StreamItem
-				for i := range s.items {
-					item := &s.items[i]
-					if now.After(item.Start) && now.Before(item.Start.Add(item.Duration)) {
-						activeItem = item
-						// Find next item
-						if i < len(s.items)-1 {
-							nextItem = &s.items[i+1]
-						}
-						break
-					}
-				}
-
-				// Prepare next source if needed
-				if nextItem != nil && !nextItemPrepared {
-					timeUntilNext := nextItem.Start.Sub(now)
-					if timeUntilNext <= 5*time.Second {
-						if err := s.prepareNextSource(nextItem); err != nil {
-							fmt.Printf("Error preparing next source: %v\n", err)
-						} else {
-							nextItemPrepared = true
-						}
-					}
-				}
-
-				// Switch to next source if needed
-				if activeItem != currentItem {
-					s.switchToNextSource()
-					currentItem = activeItem
-					nextItemPrepared = false
-					if activeItem != nil {
-						fmt.Printf("Switched to %s source: %s\n", activeItem.Type, activeItem.Source)
-					} else {
-						fmt.Println("No active item to switch to")
-					}
-				}
-
-				s.mu.Unlock()
-				time.Sleep(100 * time.Millisecond)
+	// Add sources to pipeline
+	for i, item := range items {
+		if item.Type == "file" {
+			err := s.addFileSource(i, item.Source)
+			if err != nil {
+				return fmt.Errorf("failed to add source %d: %v", i, err)
 			}
 		}
-	}()
+		// Could add other source types here (test pattern, etc.)
+	}
+
+	// Set up the schedule
+	go s.runSchedule()
+
+	// Start the pipeline
+	s.pipeline.SetState(gst.StatePlaying)
+	fmt.Printf("Pipeline is running. Streaming to RTP at %s:%d\n", s.host, s.port)
+
+	// Run the main loop in a separate goroutine
+	go s.mainLoop.Run()
 
 	return nil
 }
 
-func (s *StreamScheduler) Stop() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// addFileSource adds a file source to the pipeline
+func (s *StreamScheduler) addFileSource(index int, filePath string) error {
+	// Create video source
+	source, err := gst.NewElement("uridecodebin")
+	if err != nil {
+		return fmt.Errorf("failed to create source: %v", err)
+	}
+	source.SetProperty("name", fmt.Sprintf("source%d", index))
 
-	if s.isRunning {
-		close(s.stopChan)
-		s.pipeline.SetState(gst.StateNull)
-		s.isRunning = false
+	// Make sure to handle relative paths
+	absPath, err := filepath.Abs(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to get absolute path: %v", err)
+	}
+
+	source.SetProperty("uri", "file://"+absPath)
+
+	// Add to pipeline
+	s.pipeline.Add(source)
+
+	// Connect pad-added signal
+	source.Connect("pad-added", func(self *gst.Element, pad *gst.Pad) {
+		caps := pad.CurrentCaps()
+		if caps == nil {
+			return
+		}
+
+		structure := caps.GetStructureAt(0)
+		if structure == nil {
+			return
+		}
+
+		name := structure.Name()
+
+		if len(name) >= 5 && name[:5] == "video" {
+			// Handle video pad
+			// Check if pad already exists to avoid duplicate pad warnings
+			padName := fmt.Sprintf("sink_%d", index)
+			sinkPad := s.vselector.GetStaticPad(padName)
+			if sinkPad == nil {
+				sinkPad = s.vselector.GetRequestPad(padName)
+				if sinkPad == nil {
+					fmt.Printf("Failed to get request video pad %s\n", padName)
+					return
+				}
+				pad.Link(sinkPad)
+				fmt.Printf("Linked video source%d to vselector.%s\n", index, padName)
+			} else {
+				// Pad already exists, use it without requesting a new one
+				pad.Link(sinkPad)
+				fmt.Printf("Linked video source%d to existing vselector.%s\n", index, padName)
+			}
+		} else if len(name) >= 5 && name[:5] == "audio" {
+			// Handle audio pad
+			// Check if pad already exists to avoid duplicate pad warnings
+			padName := fmt.Sprintf("sink_%d", index)
+			sinkPad := s.aselector.GetStaticPad(padName)
+			if sinkPad == nil {
+				sinkPad = s.aselector.GetRequestPad(padName)
+				if sinkPad == nil {
+					fmt.Printf("Failed to get request audio pad %s\n", padName)
+					return
+				}
+				pad.Link(sinkPad)
+				fmt.Printf("Linked audio source%d to aselector.%s\n", index, padName)
+			} else {
+				// Pad already exists, use it without requesting a new one
+				pad.Link(sinkPad)
+				fmt.Printf("Linked audio source%d to existing aselector.%s\n", index, padName)
+			}
+		}
+	})
+
+	// Store source for later reference
+	s.sources[index] = append(s.sources[index], source)
+
+	return nil
+}
+
+// runSchedule manages the timing of the scheduled items
+func (s *StreamScheduler) runSchedule() {
+	s.mutex.Lock()
+	items := make([]StreamItem, len(s.items))
+	copy(items, s.items)
+	s.mutex.Unlock()
+
+	// Sort items by start time if needed
+
+	for i, item := range items {
+		// Calculate how long to wait until this item should start
+		waitTime := time.Until(item.Start)
+		if waitTime > 0 {
+			select {
+			case <-time.After(waitTime):
+				// Time to switch to this source
+				s.switchToSource(i)
+			case <-s.stopChan:
+				// Scheduler is stopping
+				return
+			}
+		} else {
+			// Start time is in the past, switch immediately
+			s.switchToSource(i)
+		}
+
+		// Wait for the duration of this item
+		select {
+		case <-time.After(item.Duration):
+			// Item duration complete
+			continue
+		case <-s.stopChan:
+			// Scheduler is stopping
+			return
+		}
 	}
 }
 
-// GenerateSDPFile creates an SDP file that can be used with media players like VLC
-func (s *StreamScheduler) GenerateSDPFile(filename string) error {
-	sdpContent := fmt.Sprintf(`v=0
-o=- 0 0 IN IP4 127.0.0.1
-s=MPEG-TS RTP Stream
-c=IN IP4 %s
-t=0 0
-m=video %d RTP/AVP 33
-a=rtpmap:33 MP2T/90000
-`, s.outputHost, s.outputPort)
+// switchToSource switches the pipeline to use the specified source
+func (s *StreamScheduler) switchToSource(index int) {
+	fmt.Printf("Switching to source %d\n", index)
 
-	return os.WriteFile(filename, []byte(sdpContent), 0644)
+	// This needs to be executed in the main loop's context
+	glib.IdleAdd(func() bool {
+		sinkVideo := s.vselector.GetStaticPad(fmt.Sprintf("sink_%d", index))
+		if sinkVideo != nil {
+			s.vselector.SetProperty("active-pad", sinkVideo)
+		}
+
+		sinkAudio := s.aselector.GetStaticPad(fmt.Sprintf("sink_%d", index))
+		if sinkAudio != nil {
+			s.aselector.SetProperty("active-pad", sinkAudio)
+		}
+
+		return false
+	})
+}
+
+// Stop stops the scheduler and pipeline
+func (s *StreamScheduler) Stop() {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	if !s.running {
+		return
+	}
+
+	// Signal scheduler to stop
+	close(s.stopChan)
+	s.running = false
+
+	// Stop the pipeline
+	if s.pipeline != nil {
+		s.pipeline.SetState(gst.StateNull)
+	}
+
+	// Quit the main loop
+	if s.mainLoop != nil {
+		s.mainLoop.Quit()
+	}
 }
