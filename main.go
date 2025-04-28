@@ -1,0 +1,75 @@
+package main
+
+import (
+	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"scheduler-rtp/scheduler" // Import the local scheduler package
+
+	"github.com/go-gst/go-gst/gst"
+)
+
+func main() {
+	// Initialize GStreamer
+	gst.Init(nil)
+
+	// Create a new stream scheduler with output to localhost:5000
+	streamScheduler, err := scheduler.NewStreamScheduler("239.1.1.2", 5000)
+	if err != nil {
+		log.Fatalf("Failed to create scheduler: %v", err)
+	}
+
+	// Get current time to schedule items relative to now
+	now := time.Now()
+
+	// Add test file items
+	// We'll schedule a test pattern for 10 seconds, then a file for 10 seconds, then back to test pattern
+	streamScheduler.AddItem(scheduler.StreamItem{
+		Type:     "file",
+		Source:   "input.mp4", // First video file
+		Start:    now,
+		Duration: 100 * time.Second,
+	})
+
+	streamScheduler.AddItem(scheduler.StreamItem{
+		Type:     "file",
+		Source:   "input2.mp4", // Second video file
+		Start:    now.Add(100 * time.Second),
+		Duration: 100 * time.Second,
+	})
+
+	streamScheduler.AddItem(scheduler.StreamItem{
+		Type:     "file",
+		Source:   "input.mp4", // Back to first video
+		Start:    now.Add(200 * time.Second),
+		Duration: 100 * time.Second,
+	})
+
+	// Start the scheduler
+	if err := streamScheduler.Start(); err != nil {
+		log.Fatalf("Failed to start scheduler: %v", err)
+	}
+
+	// Direct RTP URL for VLC
+	fmt.Printf("To play in VLC: Open VLC and go to Media > Open Network Stream > enter rtp://@%s:%d\n",
+		"239.1.1.2", 5000)
+
+	fmt.Println("Scheduler started. Press Ctrl+C to exit.")
+	fmt.Println("Schedule:")
+	fmt.Printf("0-100s: Test pattern\n")
+	fmt.Printf("100-200s: Test video\n")
+	fmt.Printf("200-300s: Test pattern\n")
+
+	// Wait for interrupt signal
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	<-sigChan
+
+	// Stop the scheduler
+	streamScheduler.Stop()
+	fmt.Println("Scheduler stopped.")
+}
