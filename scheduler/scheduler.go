@@ -266,35 +266,21 @@ func (s *StreamScheduler) Start() error {
 	finalIdentity.Link(rtpmp2tpay)
 	rtpmp2tpay.Link(udpsink)
 
-	// Add pad probes to drop late buffers
-	vsrcpad := s.vselector.GetStaticPad("src")
-	if vsrcpad != nil {
-		vsrcpad.AddProbe(gst.PadProbeTypeBuffer, func(pad *gst.Pad, info *gst.PadProbeInfo) gst.PadProbeReturn {
-			return gst.PadProbeOK
-		})
-	}
 
-	asrcpad := s.aselector.GetStaticPad("src")
-	if asrcpad != nil {
-		asrcpad.AddProbe(gst.PadProbeTypeBuffer, func(pad *gst.Pad, info *gst.PadProbeInfo) gst.PadProbeReturn {
-			return gst.PadProbeOK
-		})
-	}
-
-	// Add pad probes to monitor caps negotiation
-	vsrcpad = s.vselector.GetStaticPad("src")
-	if vsrcpad != nil {
-		vsrcpad.AddProbe(gst.PadProbeTypeEventDownstream, func(pad *gst.Pad, info *gst.PadProbeInfo) gst.PadProbeReturn {
-			event := info.GetEvent()
-			if event != nil && event.Type() == gst.EventTypeCaps {
-				caps := event.ParseCaps()
-				if caps != nil {
-					fmt.Printf("Video caps from selector: %s\n", caps.String())
-				}
-			}
-			return gst.PadProbeOK
-		})
-	}
+	// // Add pad probes to monitor caps negotiation
+	// vsrcpad = s.vselector.GetStaticPad("src")
+	// if vsrcpad != nil {
+	// 	vsrcpad.AddProbe(gst.PadProbeTypeEventDownstream, func(pad *gst.Pad, info *gst.PadProbeInfo) gst.PadProbeReturn {
+	// 		event := info.GetEvent()
+	// 		if event != nil && event.Type() == gst.EventTypeCaps {
+	// 			caps := event.ParseCaps()
+	// 			if caps != nil {
+	// 				// fmt.Printf("Video caps from selector: %s\n", caps.String())
+	// 			}
+	// 		}
+	// 		return gst.PadProbeOK
+	// 	})
+	// }
 
 	// Create a main loop
 	s.mainLoop = glib.NewMainLoop(nil, false)
@@ -315,12 +301,12 @@ func (s *StreamScheduler) Start() error {
 		}
 		// Could add other source types here (test pattern, etc.)
 	}
+	s.pipeline.SetState(gst.StatePlaying)
 
 	// Set up the schedule
 	go s.runSchedule()
 
 	// Start the pipeline
-	s.pipeline.SetState(gst.StatePlaying)
 	fmt.Printf("Pipeline is running. Streaming RTP MPEG-TS to %s:%d\n", s.host, s.port)
 
 	// Run the main loop in a separate goroutine
@@ -382,19 +368,18 @@ func (s *StreamScheduler) addFileSource(index int, filePath string) error {
 	// Link filesrc -> typefind -> decodebin
 	filesrc.Link(typefind)
 	typefind.Link(decodebin)
-	
-	// Set elements to playing state initially, then pause them
-	// This ensures they're fully initialized and ready to play
-	filesrc.SetState(gst.StatePlaying)
-	typefind.SetState(gst.StatePlaying)
-	decodebin.SetState(gst.StatePlaying)
-	
-	// After a short delay, pause the source if it's not the first one
-	if index > 0 {
-		go func() {
-			time.Sleep(500 * time.Millisecond) // Give it time to initialize
-			filesrc.SetState(gst.StatePaused)
-		}()
+
+	// Set initial state based on index
+	if index == 0 {
+		// First video should be PLAYING initially
+		filesrc.SetState(gst.StateNull)
+		typefind.SetState(gst.StateNull)
+		decodebin.SetState(gst.StateNull)
+	} else {
+		// Additional videos should be in READY state initially
+		filesrc.SetState(gst.StateReady)
+		typefind.SetState(gst.StateReady)
+		decodebin.SetState(gst.StateReady)
 	}
 	
 	// Connect to typefind's "have-type" signal for debugging
@@ -417,7 +402,7 @@ func (s *StreamScheduler) addFileSource(index int, filePath string) error {
 		}
 		
 		name := structure.Name()
-		fmt.Printf("Decodebin pad added with caps: %s\n", caps.String())
+		// fmt.Printf("Decodebin pad added with caps: %s\n", caps.String())
 		
 		if len(name) >= 5 && name[:5] == "video" {
 			// Handle video pad
@@ -487,56 +472,91 @@ func (s *StreamScheduler) runSchedule() {
 	for i, item := range items {
 		// Calculate how long to wait until this item should start
 		waitTime := time.Until(item.Start)
-		if waitTime > 0 {
-			select {
-			case <-time.After(waitTime):
-				// Time to switch to this source
-				s.switchToSource(i)
-				
-				// Update the current offset for continuous timestamps
-				s.currentOffset = lastEndTime
-				
-			case <-s.stopChan:
-				// Scheduler is stopping
-				return
-			}
-		} else {
-			// Start time is in the past, switch immediately
-			s.switchToSource(i)
+		fmt.Printf("[%s] Item %d: Scheduled start time: %s, wait time: %s\n", 
+			time.Now().Format("15:04:05.000"), i, item.Start.Format("15:04:05.000"), waitTime)
+		
+		// For the first item (i==0), we want to start playing immediately
+		// For subsequent items, we need to wait until their scheduled start time
+		if i == 0 || waitTime <= 0 {
+			fmt.Printf("[%s] Item %d: Starting immediately\n", 
+				time.Now().Format("15:04:05.000"), i)
+			// Switch to this source immediately
+			s.playSource(i)
 			
 			// Update the current offset for continuous timestamps
 			s.currentOffset = lastEndTime
+			fmt.Printf("[%s] Item %d: Updated currentOffset to %d ns\n", 
+				time.Now().Format("15:04:05.000"), i, lastEndTime)
+		} else {
+			fmt.Printf("[%s] Item %d: Waiting %s until scheduled start time\n", 
+				time.Now().Format("15:04:05.000"), i, waitTime)
+			select {
+			case <-time.After(waitTime):
+				fmt.Printf("[%s] Item %d: Wait complete, switching to source\n", 
+					time.Now().Format("15:04:05.000"), i)
+				// Time to switch to this source
+				s.playSource(i)
+				
+				// Update the current offset for continuous timestamps
+				s.currentOffset = lastEndTime
+				fmt.Printf("[%s] Item %d: Updated currentOffset to %d ns\n", 
+					time.Now().Format("15:04:05.000"), i, lastEndTime)
+				
+			case <-s.stopChan:
+				fmt.Printf("[%s] Item %d: Received stop signal during wait\n", 
+					time.Now().Format("15:04:05.000"), i)
+				// Scheduler is stopping
+				return
+			}
 		}
 
 		// Prepare the next item if available
 		if nextItemIndex < len(items) {
-			// Calculate when to prepare the next item (e.g., 5 seconds before current item ends)
-			prepareTime := item.Duration - 5*time.Second
+			// Calculate when to prepare the next item (500ms before current item ends)
+			prepareTime := item.Duration - 500*time.Millisecond
 			if prepareTime < 0 {
 				prepareTime = item.Duration / 2  // If item is short, prepare halfway through
 			}
 			
+			fmt.Printf("[%s] Item %d: Will prepare next source %d in %s\n", 
+				time.Now().Format("15:04:05.000"), i, nextItemIndex, prepareTime)
+			
 			go func(nextIdx int) {
+				fmt.Printf("[%s] Item %d: Started preparation timer for next source %d\n", 
+					time.Now().Format("15:04:05.000"), i, nextIdx)
 				select {
 				case <-time.After(prepareTime):
-					fmt.Printf("Preparing next source %d\n", nextIdx)
-					// Prepare the next source in advance
+					fmt.Printf("[%s] Item %d: Preparation time reached for next source %d\n", 
+						time.Now().Format("15:04:05.000"), i, nextIdx)
+					// Prepare the next source
 					s.prepareSource(nextIdx)
 				case <-s.stopChan:
+					fmt.Printf("[%s] Item %d: Received stop signal during preparation wait\n", 
+						time.Now().Format("15:04:05.000"), i)
 					return
 				}
 			}(nextItemIndex)
 			
 			nextItemIndex++
+		} else {
+			fmt.Printf("[%s] Item %d: No more items to prepare\n", 
+				time.Now().Format("15:04:05.000"), i)
 		}
 
 		// Wait for the duration of this item
+		fmt.Printf("[%s] Item %d: Playing for duration: %s\n", 
+			time.Now().Format("15:04:05.000"), i, item.Duration)
 		select {
 		case <-time.After(item.Duration):
 			// Item duration complete
 			lastEndTime += item.Duration.Nanoseconds()  // Update the end time
+			fmt.Printf("[%s] Item %d: Playback complete, updated lastEndTime to %d ns\n", 
+				time.Now().Format("15:04:05.000"), i, lastEndTime)
+
 			continue
 		case <-s.stopChan:
+			fmt.Printf("[%s] Item %d: Received stop signal during playback\n", 
+				time.Now().Format("15:04:05.000"), i)
 			// Scheduler is stopping
 			return
 		}
@@ -544,25 +564,25 @@ func (s *StreamScheduler) runSchedule() {
 }
 
 // prepareSource prepares a source for playback without actually playing it
+// Called 500ms before the end of the current video
 func (s *StreamScheduler) prepareSource(index int) {
 	fmt.Printf("Preparing source %d for playback\n", index)
 	
 	glib.IdleAdd(func() bool {
 		elements, exists := s.sources[index]
-		if !exists || len(elements) < 1 {
+		if !exists || len(elements) < 3 {
+			fmt.Printf("Error: Source elements for index %d not found\n", index)
 			return false
 		}
 		
-		// Get the filesrc element
-		filesrc := elements[0]
+		// Get the elements
+		filesrc := elements[0]		
+		// Set to PAUSED state (from READY)
+		filesrc.SetState(gst.StatePaused)		
+		// Seek to beginning to ensure we start from the beginning
+		// s.seekSourceToBeginning(index)
 		
-		// Make sure it's in the paused state
-		filesrc.SetState(gst.StatePaused)
-		
-		// Seek to beginning
-		s.seekSourceToBeginning(index)
-		
-		fmt.Printf("Source %d is prepared and ready to play\n", index)
+		fmt.Printf("Source %d is prepared and ready to play (PAUSED state)\n", index)
 		return false
 	})
 }
@@ -592,97 +612,49 @@ func (s *StreamScheduler) playSource(index int) {
 		
 		// Play the first element (filesrc) to effectively play the source
 		filesrc := elements[0]
-		
-		// First make sure it's in paused state
-		filesrc.SetState(gst.StatePaused)
-		
-		// Then seek to beginning to ensure we start from the beginning
-		s.seekSourceToBeginning(index)
-		
-		// Finally set to playing
-		filesrc.SetState(gst.StatePlaying)
-		
-		fmt.Printf("Source %d is now playing\n", index)
-		return false
-	})
-}
-
-// seekSourceToBeginning seeks the specified source to the beginning (0s)
-func (s *StreamScheduler) seekSourceToBeginning(index int) {
-	fmt.Printf("Seeking source %d to beginning\n", index)
-
-	// This needs to be executed in the main loop's context
-	glib.IdleAdd(func() bool {
-		// Get the decodebin element for this source
-		elements, exists := s.sources[index]
-		if !exists || len(elements) < 3 {
-			fmt.Printf("Error: Source elements for index %d not found\n", index)
-			return false
-		}
-		
-		// The decodebin is the third element in our sources array
+		typefind := elements[1]
 		decodebin := elements[2]
-		
-		// Create a seek event
+		filesrc.SetState(gst.StatePaused)
+		typefind.SetState(gst.StatePaused)
+		decodebin.SetState(gst.StatePaused)
+
 		seekEvent := gst.NewSeekEvent(
-			1.0,                                      // rate
-			gst.FormatTime,                           // format
-			gst.SeekFlagFlush|gst.SeekFlagAccurate,   // flags
-			gst.SeekTypeSet,                          // start_type
-			0,                                        // start
-			gst.SeekTypeNone,                         // stop_type
-			-1,								                        // stop
-		)
+            1.0,                                    // rate
+            gst.FormatTime,                         // format
+            gst.SeekFlagFlush|gst.SeekFlagAccurate, // flags
+            gst.SeekTypeSet,                        // start_type
+            0,                                      // start
+            gst.SeekTypeNone,                       // stop_type
+            -1,                                     // stop
+        )
+        
+        // Send seek event to filesrc
+        if !filesrc.SendEvent(seekEvent) {
+            fmt.Printf("[%s] Failed to seek source %d to beginning\n", 
+                time.Now().Format("15:04:05.000"), index)
+        } else {
+            fmt.Printf("[%s] Successfully sought source %d to beginning\n", 
+                time.Now().Format("15:04:05.000"), index)
+        }
+        
+		filesrc.SetState(gst.StatePlaying)
+		typefind.SetState(gst.StatePlaying)
+		decodebin.SetState(gst.StatePlaying)
 		
-		// Send the seek event to the element
-		result := decodebin.SendEvent(seekEvent)
-		
-		if !result {
-			fmt.Printf("Failed to seek source %d to beginning\n", index)
-		} else {
-			fmt.Printf("Successfully sought source %d to beginning\n", index)
-		}
-		
-		return false
-	})
-}
-
-// switchToSource switches the pipeline to use the specified source
-func (s *StreamScheduler) switchToSource(index int) {
-	fmt.Printf("Switching to source %d\n", index)
-
-	// This needs to be executed in the main loop's context
-	glib.IdleAdd(func() bool {
-		// Switch the selectors to the new source first
 		sinkVideo := s.vselector.GetStaticPad(fmt.Sprintf("sink_%d", index))
 		if sinkVideo != nil {
 			s.vselector.SetProperty("active-pad", sinkVideo)
+		} else {
+			fmt.Printf("Warning: No video sink pad for source %d\n", index)
 		}
 
 		sinkAudio := s.aselector.GetStaticPad(fmt.Sprintf("sink_%d", index))
 		if sinkAudio != nil {
 			s.aselector.SetProperty("active-pad", sinkAudio)
+		} else {
+			fmt.Printf("Warning: No audio sink pad for source %d\n", index)
 		}
-		
-		// Now play the source we switched to
-		elements, exists := s.sources[index]
-		if !exists || len(elements) < 1 {
-			return false
-		}
-		
-		// Get the filesrc element
-		filesrc := elements[0]
-		
-		// Set to playing state
-		filesrc.SetState(gst.StatePlaying)
-		
-		// Pause all other sources to save resources
-		for idx := range s.sources {
-			if idx != index {
-				s.pauseSource(idx)
-			}
-		}
-		
+
 		fmt.Printf("Source %d is now playing\n", index)
 		return false
 	})
