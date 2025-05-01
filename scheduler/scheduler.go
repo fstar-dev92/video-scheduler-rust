@@ -20,19 +20,19 @@ type StreamItem struct {
 
 // StreamScheduler manages a GStreamer pipeline for scheduled playback
 type StreamScheduler struct {
-	host      string
-	port      int
-	items     []StreamItem
-	pipeline  *gst.Pipeline
-	mainLoop  *glib.MainLoop
-	vselector *gst.Element
-	aselector *gst.Element
-	mutex     sync.Mutex
-	stopChan  chan struct{}
-	running   bool
-	sources   map[int][]*gst.Element // Track sources by index
-	baseTime      int64        // Base time for continuous timestamps
-	currentOffset int64        // Current offset for timestamps
+	host          string
+	port          int
+	items         []StreamItem
+	pipeline      *gst.Pipeline
+	mainLoop      *glib.MainLoop
+	vselector     *gst.Element
+	aselector     *gst.Element
+	mutex         sync.Mutex
+	stopChan      chan struct{}
+	running       bool
+	sources       map[int][]*gst.Element // Track sources by index
+	baseTime      int64                  // Base time for continuous timestamps
+	currentOffset int64                  // Current offset for timestamps
 }
 
 // NewStreamScheduler creates a new stream scheduler
@@ -88,14 +88,14 @@ func (s *StreamScheduler) Start() error {
 	if err != nil {
 		return fmt.Errorf("failed to create video identity: %v", err)
 	}
-	videoIdentity.SetProperty("reset-pts", true)
+	videoIdentity.SetProperty("reset-pts", false)
 	videoIdentity.SetProperty("sync", true)
 
 	audioIdentity, err := gst.NewElement("identity")
 	if err != nil {
 		return fmt.Errorf("failed to create audio identity: %v", err)
 	}
-	audioIdentity.SetProperty("reset-pts", true)
+	audioIdentity.SetProperty("reset-pts", false)
 	audioIdentity.SetProperty("sync", true)
 
 	videoconv, err := gst.NewElement("videoconvert")
@@ -132,6 +132,14 @@ func (s *StreamScheduler) Start() error {
 		return fmt.Errorf("failed to create h264parse: %v", err)
 	}
 
+	// Add tsparse to handle timestamp adjustments
+	tsparse, err := gst.NewElement("tsparse")
+	if err != nil {
+		return fmt.Errorf("failed to create tsparse: %v", err)
+	}
+	tsparse.SetProperty("set-timestamps", true)
+	tsparse.SetProperty("ignore-pcr", true)
+
 	// Add audioconvert and audioresample before the selector to handle format differences
 	audioconv, err := gst.NewElement("audioconvert")
 	if err != nil {
@@ -163,19 +171,19 @@ func (s *StreamScheduler) Start() error {
 		return fmt.Errorf("failed to create mpegtsmux: %v", err)
 	}
 	mpegtsmux.SetProperty("name", "mux")
-	
+
 	// Add RTP payloader for MPEG-TS
 	rtpmp2tpay, err := gst.NewElement("rtpmp2tpay")
 	if err != nil {
 		return fmt.Errorf("failed to create rtpmp2tpay: %v", err)
 	}
-	
+
 	// UDP sink for RTP MPEG-TS
 	udpsink, err := gst.NewElement("udpsink")
 	if err != nil {
 		return fmt.Errorf("failed to create udpsink: %v", err)
 	}
-	
+
 	// Configure elements for better latency handling
 	videoIdentity.SetProperty("sync", true)
 	audioIdentity.SetProperty("sync", true)
@@ -185,16 +193,18 @@ func (s *StreamScheduler) Start() error {
 	}
 	finalIdentity.SetProperty("single-segment", true)
 	finalIdentity.SetProperty("sync", true)
-	
+
 	// Set max-lateness property on udpsink to handle late buffers better
 	udpsink.SetProperty("max-lateness", 10000000) // 10ms max lateness
 	udpsink.SetProperty("buffer-size", 2097152)   // 2MB buffer size
-	
+
 	// Configure input-selector elements for better synchronization
-	s.vselector.SetProperty("sync-streams", true)
-	s.vselector.SetProperty("sync-mode", 1) // 1 = sync-to-clock
-	s.aselector.SetProperty("sync-streams", true)
-	s.aselector.SetProperty("sync-mode", 1)
+	s.vselector.SetProperty("sync-streams", false)
+	s.vselector.SetProperty("sync-mode", 0) // 0 = sync-to-first-running-sink
+	s.vselector.SetProperty("cache-buffers", true)
+	s.aselector.SetProperty("sync-streams", false)
+	s.aselector.SetProperty("sync-mode", 0) // 0 = sync-to-first-running-sink
+	s.aselector.SetProperty("cache-buffers", true)
 
 	// Configure H264 encoder for better compatibility and performance
 	h264enc.SetProperty("tune", "zerolatency")
@@ -207,23 +217,23 @@ func (s *StreamScheduler) Start() error {
 	aacenc.SetProperty("bitrate", 128000) // 128kbps audio
 
 	// Configure RTP MPEG-TS payloader
-	rtpmp2tpay.SetProperty("pt", 33)  // Payload type for MPEG-TS
-	
+	rtpmp2tpay.SetProperty("pt", 33) // Payload type for MPEG-TS
+
 	// Set UDP properties for RTP MPEG-TS multicast
 	udpsink.SetProperty("host", s.host)
 	udpsink.SetProperty("port", s.port)
 	udpsink.SetProperty("auto-multicast", true)
 
 	// Configure mpegtsmux for better timestamp handling
-	mpegtsmux.SetProperty("alignment", 7)  // 7 = GST_MPEG_TS_MUX_ALIGNMENT_ALIGNED
-	
+	mpegtsmux.SetProperty("alignment", 7) // 7 = GST_MPEG_TS_MUX_ALIGNMENT_ALIGNED
+
 	// Use nanoseconds for time values (1 ms = 1,000,000 ns)
-	mpegtsmux.SetProperty("pat-interval", int64(100 * 1000000))  // 100 ms
-	mpegtsmux.SetProperty("pmt-interval", int64(100 * 1000000))  // 100 ms
-	mpegtsmux.SetProperty("pcr-interval", int64(20 * 1000000))   // 20 ms
-	
+	mpegtsmux.SetProperty("pat-interval", int64(100*1000000)) // 100 ms
+	mpegtsmux.SetProperty("pmt-interval", int64(100*1000000)) // 100 ms
+	mpegtsmux.SetProperty("pcr-interval", int64(20*1000000))  // 20 ms
+
 	// Add a tsmux property to handle timestamp discontinuities better
-	mpegtsmux.SetProperty("dts-delta", int64(1000 * 1000000))    // 1000 ms (1 second)
+	mpegtsmux.SetProperty("dts-delta", int64(1000*1000000)) // 1000 ms (1 second)
 
 	// Add elements to pipeline
 	s.pipeline.Add(s.vselector)
@@ -265,7 +275,6 @@ func (s *StreamScheduler) Start() error {
 	mpegtsmux.Link(finalIdentity)
 	finalIdentity.Link(rtpmp2tpay)
 	rtpmp2tpay.Link(udpsink)
-
 
 	// // Add pad probes to monitor caps negotiation
 	// vsrcpad = s.vselector.GetStaticPad("src")
@@ -330,41 +339,41 @@ func (s *StreamScheduler) Start() error {
 // addFileSource adds a file source to the pipeline
 func (s *StreamScheduler) addFileSource(index int, filePath string) error {
 	fmt.Printf("Adding file source for %s at index %d\n", filePath, index)
-	
+
 	// Instead of uridecodebin, let's use a more explicit pipeline for better control
 	filesrc, err := gst.NewElement("filesrc")
 	if err != nil {
 		return fmt.Errorf("failed to create filesrc: %v", err)
 	}
 	filesrc.SetProperty("name", fmt.Sprintf("filesrc%d", index))
-	
+
 	// Make sure to handle relative paths
 	absPath, err := filepath.Abs(filePath)
 	if err != nil {
 		return fmt.Errorf("failed to get absolute path: %v", err)
 	}
-	
+
 	filesrc.SetProperty("location", absPath)
 	filesrc.SetProperty("buffer-size", 10485760) // 10MB buffer
-	
+
 	// Add typefind to detect file type
 	typefind, err := gst.NewElement("typefind")
 	if err != nil {
 		return fmt.Errorf("failed to create typefind: %v", err)
 	}
-	
+
 	// Add decodebin to handle decoding
 	decodebin, err := gst.NewElement("decodebin")
 	if err != nil {
 		return fmt.Errorf("failed to create decodebin: %v", err)
 	}
 	decodebin.SetProperty("name", fmt.Sprintf("decode%d", index))
-	
+
 	// Add elements to pipeline
 	s.pipeline.Add(filesrc)
 	s.pipeline.Add(typefind)
 	s.pipeline.Add(decodebin)
-	
+
 	// Link filesrc -> typefind -> decodebin
 	filesrc.Link(typefind)
 	typefind.Link(decodebin)
@@ -381,12 +390,12 @@ func (s *StreamScheduler) addFileSource(index int, filePath string) error {
 		typefind.SetState(gst.StateReady)
 		decodebin.SetState(gst.StateReady)
 	}
-	
+
 	// Connect to typefind's "have-type" signal for debugging
 	typefind.Connect("have-type", func(self *gst.Element, probability uint, caps *gst.Caps) {
 		fmt.Printf("File type detected: %s (probability: %d)\n", caps.String(), probability)
 	})
-	
+
 	// Connect to decodebin's pad-added signal
 	decodebin.Connect("pad-added", func(self *gst.Element, pad *gst.Pad) {
 		caps := pad.CurrentCaps()
@@ -394,16 +403,16 @@ func (s *StreamScheduler) addFileSource(index int, filePath string) error {
 			fmt.Printf("Warning: Pad has no caps\n")
 			return
 		}
-		
+
 		structure := caps.GetStructureAt(0)
 		if structure == nil {
 			fmt.Printf("Warning: Caps has no structure\n")
 			return
 		}
-		
+
 		name := structure.Name()
 		// fmt.Printf("Decodebin pad added with caps: %s\n", caps.String())
-		
+
 		if len(name) >= 5 && name[:5] == "video" {
 			// Handle video pad
 			padName := fmt.Sprintf("sink_%d", index)
@@ -412,14 +421,14 @@ func (s *StreamScheduler) addFileSource(index int, filePath string) error {
 				fmt.Printf("Failed to get request video pad %s\n", padName)
 				return
 			}
-			
+
 			linkResult := pad.Link(sinkPad)
 			if linkResult != gst.PadLinkOK {
 				fmt.Printf("Video pad link failed: %v\n", linkResult)
 				return
 			}
 			fmt.Printf("Linked video decode%d to vselector.%s\n", index, padName)
-			
+
 		} else if len(name) >= 5 && name[:5] == "audio" {
 			// Handle audio pad
 			padName := fmt.Sprintf("sink_%d", index)
@@ -428,7 +437,7 @@ func (s *StreamScheduler) addFileSource(index int, filePath string) error {
 				fmt.Printf("Failed to get request audio pad %s\n", padName)
 				return
 			}
-			
+
 			linkResult := pad.Link(sinkPad)
 			if linkResult != gst.PadLinkOK {
 				fmt.Printf("Audio pad link failed: %v\n", linkResult)
@@ -439,21 +448,21 @@ func (s *StreamScheduler) addFileSource(index int, filePath string) error {
 			fmt.Printf("Ignoring pad with caps: %s\n", caps.String())
 		}
 	})
-	
+
 	// Connect to decodebin's no-more-pads signal for debugging
 	decodebin.Connect("no-more-pads", func(self *gst.Element) {
 		fmt.Printf("Decodebin has no more pads\n")
 	})
-	
+
 	// Connect to decodebin's autoplug-select signal to help with format selection
 	decodebin.Connect("autoplug-select", func(self *gst.Element, pad *gst.Pad, caps *gst.Caps, factory *gst.ElementFactory) int {
 		fmt.Printf("Autoplug select for %s: %s\n", factory.GetName(), caps.String())
 		return 0 // GST_AUTOPLUG_SELECT_TRY
 	})
-	
+
 	// Store sources for later reference
 	s.sources[index] = append(s.sources[index], filesrc, typefind, decodebin)
-	
+
 	return nil
 }
 
@@ -465,45 +474,45 @@ func (s *StreamScheduler) runSchedule() {
 	s.mutex.Unlock()
 
 	// Sort items by start time if needed
-	
-	var lastEndTime int64 = 0  // Track the end time of the last video
-	var nextItemIndex = 1      // Index of the next item to prepare
+
+	var lastEndTime int64 = 0 // Track the end time of the last video
+	var nextItemIndex = 1     // Index of the next item to prepare
 
 	for i, item := range items {
 		// Calculate how long to wait until this item should start
 		waitTime := time.Until(item.Start)
-		fmt.Printf("[%s] Item %d: Scheduled start time: %s, wait time: %s\n", 
+		fmt.Printf("[%s] Item %d: Scheduled start time: %s, wait time: %s\n",
 			time.Now().Format("15:04:05.000"), i, item.Start.Format("15:04:05.000"), waitTime)
-		
+
 		// For the first item (i==0), we want to start playing immediately
 		// For subsequent items, we need to wait until their scheduled start time
 		if i == 0 || waitTime <= 0 {
-			fmt.Printf("[%s] Item %d: Starting immediately\n", 
+			fmt.Printf("[%s] Item %d: Starting immediately\n",
 				time.Now().Format("15:04:05.000"), i)
 			// Switch to this source immediately
 			s.playSource(i)
-			
+
 			// Update the current offset for continuous timestamps
 			s.currentOffset = lastEndTime
-			fmt.Printf("[%s] Item %d: Updated currentOffset to %d ns\n", 
+			fmt.Printf("[%s] Item %d: Updated currentOffset to %d ns\n",
 				time.Now().Format("15:04:05.000"), i, lastEndTime)
 		} else {
-			fmt.Printf("[%s] Item %d: Waiting %s until scheduled start time\n", 
+			fmt.Printf("[%s] Item %d: Waiting %s until scheduled start time\n",
 				time.Now().Format("15:04:05.000"), i, waitTime)
 			select {
 			case <-time.After(waitTime):
-				fmt.Printf("[%s] Item %d: Wait complete, switching to source\n", 
+				fmt.Printf("[%s] Item %d: Wait complete, switching to source\n",
 					time.Now().Format("15:04:05.000"), i)
 				// Time to switch to this source
 				s.playSource(i)
-				
+
 				// Update the current offset for continuous timestamps
 				s.currentOffset = lastEndTime
-				fmt.Printf("[%s] Item %d: Updated currentOffset to %d ns\n", 
+				fmt.Printf("[%s] Item %d: Updated currentOffset to %d ns\n",
 					time.Now().Format("15:04:05.000"), i, lastEndTime)
-				
+
 			case <-s.stopChan:
-				fmt.Printf("[%s] Item %d: Received stop signal during wait\n", 
+				fmt.Printf("[%s] Item %d: Received stop signal during wait\n",
 					time.Now().Format("15:04:05.000"), i)
 				// Scheduler is stopping
 				return
@@ -515,47 +524,47 @@ func (s *StreamScheduler) runSchedule() {
 			// Calculate when to prepare the next item (500ms before current item ends)
 			prepareTime := item.Duration - 500*time.Millisecond
 			if prepareTime < 0 {
-				prepareTime = item.Duration / 2  // If item is short, prepare halfway through
+				prepareTime = item.Duration / 2 // If item is short, prepare halfway through
 			}
-			
-			fmt.Printf("[%s] Item %d: Will prepare next source %d in %s\n", 
+
+			fmt.Printf("[%s] Item %d: Will prepare next source %d in %s\n",
 				time.Now().Format("15:04:05.000"), i, nextItemIndex, prepareTime)
-			
+
 			go func(nextIdx int) {
-				fmt.Printf("[%s] Item %d: Started preparation timer for next source %d\n", 
+				fmt.Printf("[%s] Item %d: Started preparation timer for next source %d\n",
 					time.Now().Format("15:04:05.000"), i, nextIdx)
 				select {
 				case <-time.After(prepareTime):
-					fmt.Printf("[%s] Item %d: Preparation time reached for next source %d\n", 
+					fmt.Printf("[%s] Item %d: Preparation time reached for next source %d\n",
 						time.Now().Format("15:04:05.000"), i, nextIdx)
 					// Prepare the next source
 					s.prepareSource(nextIdx)
 				case <-s.stopChan:
-					fmt.Printf("[%s] Item %d: Received stop signal during preparation wait\n", 
+					fmt.Printf("[%s] Item %d: Received stop signal during preparation wait\n",
 						time.Now().Format("15:04:05.000"), i)
 					return
 				}
 			}(nextItemIndex)
-			
+
 			nextItemIndex++
 		} else {
-			fmt.Printf("[%s] Item %d: No more items to prepare\n", 
+			fmt.Printf("[%s] Item %d: No more items to prepare\n",
 				time.Now().Format("15:04:05.000"), i)
 		}
 
 		// Wait for the duration of this item
-		fmt.Printf("[%s] Item %d: Playing for duration: %s\n", 
+		fmt.Printf("[%s] Item %d: Playing for duration: %s\n",
 			time.Now().Format("15:04:05.000"), i, item.Duration)
 		select {
 		case <-time.After(item.Duration):
 			// Item duration complete
-			lastEndTime += item.Duration.Nanoseconds()  // Update the end time
-			fmt.Printf("[%s] Item %d: Playback complete, updated lastEndTime to %d ns\n", 
+			lastEndTime += item.Duration.Nanoseconds() // Update the end time
+			fmt.Printf("[%s] Item %d: Playback complete, updated lastEndTime to %d ns\n",
 				time.Now().Format("15:04:05.000"), i, lastEndTime)
 
 			continue
 		case <-s.stopChan:
-			fmt.Printf("[%s] Item %d: Received stop signal during playback\n", 
+			fmt.Printf("[%s] Item %d: Received stop signal during playback\n",
 				time.Now().Format("15:04:05.000"), i)
 			// Scheduler is stopping
 			return
@@ -567,21 +576,21 @@ func (s *StreamScheduler) runSchedule() {
 // Called 500ms before the end of the current video
 func (s *StreamScheduler) prepareSource(index int) {
 	fmt.Printf("Preparing source %d for playback\n", index)
-	
+
 	glib.IdleAdd(func() bool {
 		elements, exists := s.sources[index]
 		if !exists || len(elements) < 3 {
 			fmt.Printf("Error: Source elements for index %d not found\n", index)
 			return false
 		}
-		
+
 		// Get the elements
-		filesrc := elements[0]		
+		filesrc := elements[0]
 		// Set to PAUSED state (from READY)
-		filesrc.SetState(gst.StatePaused)		
+		filesrc.SetState(gst.StatePaused)
 		// Seek to beginning to ensure we start from the beginning
 		// s.seekSourceToBeginning(index)
-		
+
 		fmt.Printf("Source %d is prepared and ready to play (PAUSED state)\n", index)
 		return false
 	})
@@ -594,7 +603,7 @@ func (s *StreamScheduler) pauseSource(index int) {
 		if !exists || len(elements) < 1 {
 			return false
 		}
-		
+
 		// Pause the first element (filesrc) to effectively pause the source
 		filesrc := elements[0]
 		filesrc.SetState(gst.StatePaused)
@@ -609,41 +618,12 @@ func (s *StreamScheduler) playSource(index int) {
 		if !exists || len(elements) < 1 {
 			return false
 		}
-		
-		// Play the first element (filesrc) to effectively play the source
-		filesrc := elements[0]
-		typefind := elements[1]
-		decodebin := elements[2]
-		filesrc.SetState(gst.StatePaused)
-		typefind.SetState(gst.StatePaused)
-		decodebin.SetState(gst.StatePaused)
-
-		seekEvent := gst.NewSeekEvent(
-            1.0,                                    // rate
-            gst.FormatTime,                         // format
-            gst.SeekFlagFlush|gst.SeekFlagAccurate, // flags
-            gst.SeekTypeSet,                        // start_type
-            0,                                      // start
-            gst.SeekTypeNone,                       // stop_type
-            -1,                                     // stop
-        )
-        
-        // Send seek event to filesrc
-        if !filesrc.SendEvent(seekEvent) {
-            fmt.Printf("[%s] Failed to seek source %d to beginning\n", 
-                time.Now().Format("15:04:05.000"), index)
-        } else {
-            fmt.Printf("[%s] Successfully sought source %d to beginning\n", 
-                time.Now().Format("15:04:05.000"), index)
-        }
-        
-		filesrc.SetState(gst.StatePlaying)
-		typefind.SetState(gst.StatePlaying)
-		decodebin.SetState(gst.StatePlaying)
-		
+		// First, ensure the pipeline is in PLAYING state
+		// Switch the selector pads first
 		sinkVideo := s.vselector.GetStaticPad(fmt.Sprintf("sink_%d", index))
 		if sinkVideo != nil {
 			s.vselector.SetProperty("active-pad", sinkVideo)
+			fmt.Printf("Switched video selector to pad %d\n", index)
 		} else {
 			fmt.Printf("Warning: No video sink pad for source %d\n", index)
 		}
@@ -651,9 +631,31 @@ func (s *StreamScheduler) playSource(index int) {
 		sinkAudio := s.aselector.GetStaticPad(fmt.Sprintf("sink_%d", index))
 		if sinkAudio != nil {
 			s.aselector.SetProperty("active-pad", sinkAudio)
+			fmt.Printf("Switched audio selector to pad %d\n", index)
 		} else {
 			fmt.Printf("Warning: No audio sink pad for source %d\n", index)
 		}
+
+		if index != 0 {
+			seekEvent := gst.NewSeekEvent(
+				1.0,                                    // rate
+				gst.FormatTime,                         // format
+				gst.SeekFlagFlush|gst.SeekFlagAccurate, // flags
+				gst.SeekTypeSet,                        // start_type
+				0,                                      // start
+				gst.SeekTypeNone,                       // stop_type
+				-1,                                     // stop
+			)
+
+			// Send the seek event to the pipeline
+			if !s.pipeline.SendEvent(seekEvent) {
+				fmt.Printf("Failed to seek pipeline for source %d\n", index)
+			} else {
+				fmt.Printf("Successfully sought pipeline for source %d\n", index)
+			}
+
+		}
+		// Create a seek event to reset the stream to the beginning
 
 		fmt.Printf("Source %d is now playing\n", index)
 		return false
