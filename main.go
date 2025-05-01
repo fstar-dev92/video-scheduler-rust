@@ -43,7 +43,7 @@ func main() {
 	})
 
 	// Start the scheduler
-	if err := streamScheduler.Start(); err != nil {
+	if err := streamScheduler.RunSchedule(); err != nil {
 		log.Fatalf("Failed to start scheduler: %v", err)
 	}
 
