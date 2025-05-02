@@ -107,7 +107,8 @@ func (s *StreamScheduler) RunSchedule() error {
 			return nil, fmt.Errorf("failed to create filesrc: %v", err)
 		}
 		filesrc.SetProperty("location", item.Source)
-		filesrc.SetProperty("blocksize", 4096) // Smaller block size
+		filesrc.SetProperty("blocksize", 655360) // Increase block size for faster reading
+		filesrc.SetProperty("num-buffers", 1000) // Pre-buffer more data
 
 		decodebin, err := gst.NewElement("decodebin")
 		if err != nil {
@@ -224,12 +225,13 @@ func (s *StreamScheduler) RunSchedule() error {
 		udpsink.SetProperty("host", s.host)
 		udpsink.SetProperty("port", s.port)
 		udpsink.SetProperty("auto-multicast", true)
-		udpsink.SetProperty("max-lateness", 10000000) // 10ms max lateness
 		// udpsink.SetProperty("buffer-size", 2097152)   // 2MB buffer size
+		udpsink.SetProperty("max-lateness", -1) // Don't drop late buffers
+		udpsink.SetProperty("ts-offset", 0)     // No timestamp offset
 
-		udpsink.SetProperty("sync", false)        // Don't sync to clock
-		udpsink.SetProperty("async", false)       // Don't use async buffering
-		udpsink.SetProperty("buffer-size", 65536) // Smaller buffer (64KB)
+		udpsink.SetProperty("sync", false)         // Don't sync to clock
+		udpsink.SetProperty("async", false)        // Don't use async buffering
+		udpsink.SetProperty("buffer-size", 262144) // Smaller buffer (256KB)
 
 		// Reduce latency in mpegtsmux
 		mpegtsmux.SetProperty("latency", 0) // Minimize muxer latency
@@ -245,7 +247,13 @@ func (s *StreamScheduler) RunSchedule() error {
 		// Configure identity elements
 		videoIdentity.SetProperty("sync", true)
 		audioIdentity.SetProperty("sync", true)
-
+		rtpQueue, err := gst.NewElement("queue")
+		if err != nil {
+			return nil, fmt.Errorf("failed to create rtpQueue: %v", err)
+		}
+		rtpQueue.SetProperty("max-size-buffers", 200)
+		rtpQueue.SetProperty("max-size-time", uint64(500*time.Microsecond))
+		rtpQueue.SetProperty("leaky", 2)
 		// Add all elements to pipeline
 		pipeline.Add(filesrc)
 		pipeline.Add(decodebin)
@@ -264,9 +272,12 @@ func (s *StreamScheduler) RunSchedule() error {
 		pipeline.Add(finalIdentity)
 		pipeline.Add(rtpmp2tpay)
 		pipeline.Add(udpsink)
+		pipeline.Add(rtpQueue)
 
 		// Link filesrc to decodebin
 		filesrc.Link(decodebin)
+		rtpmp2tpay.Link(rtpQueue)
+		rtpQueue.Link(udpsink)
 
 		// Set up bus to watch for messages
 		bus := pipeline.GetBus()
@@ -408,6 +419,7 @@ func (s *StreamScheduler) RunSchedule() error {
 		currentPipeline.SetState(gst.StatePlaying)
 		fmt.Printf("[%s] Item %d: Started playing\n",
 			time.Now().Format("15:04:05.000"), i)
+		time.Sleep(100 * time.Millisecond)
 
 		// If there's a next item, start preparing its pipeline immediately
 		if i+1 < len(items) {
