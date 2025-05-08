@@ -179,12 +179,6 @@ func (s *StreamScheduler) createMainPipeline() error {
 		pad2.SetProperty("alpha", 0.0) // input2 hidden
 	}
 
-	// Create video converter and encoder
-	videoconv, err := gst.NewElement("videoconvert")
-	if err != nil {
-		return fmt.Errorf("failed to create videoconvert: %v", err)
-	}
-
 	h264enc, err := gst.NewElementWithProperties("x264enc", map[string]interface{}{
 		"tune":    0x00000004, // zerolatency
 		"bitrate": 2000,       // 2 Mbps
@@ -217,12 +211,6 @@ func (s *StreamScheduler) createMainPipeline() error {
 	audiomixer.SetProperty("name", "audiomixer" + s.schedulerID)
 	if err != nil {
 		return fmt.Errorf("failed to create audiomixer: %v", err)
-	}
-
-	audioconv, err := gst.NewElement("audioconvert")
-	audioconv.SetProperty("name", "audioconv" + s.schedulerID)
-	if err != nil {
-		return fmt.Errorf("failed to create audioconvert: %v", err)
 	}
 
 	aacenc, err := gst.NewElementWithProperties("avenc_aac", map[string]interface{}{
@@ -394,8 +382,8 @@ func (s *StreamScheduler) createMainPipeline() error {
 	pipeline.AddMany(audioconv1, audioconv2, audioresample1, audioresample2, audiocaps1, audiocaps2)
 
 	// Add all elements to the pipeline
-	pipeline.AddMany(intervideo1, intervideo2, s.compositor, videoconv, h264enc)
-	pipeline.AddMany(interaudio1, interaudio2, audiomixer, audioconv, aacenc)
+	pipeline.AddMany(intervideo1, intervideo2, s.compositor, h264enc)
+	pipeline.AddMany(interaudio1, interaudio2, audiomixer, aacenc)
 	pipeline.AddMany(mpegtsmux, rtpmp2tpay, udpsink)
 	pipeline.AddMany(videoQueue1, videoQueue2, audioQueue1, audioQueue2)
 	pipeline.AddMany(videoMixerQueue, audioMixerQueue, muxerQueue)
@@ -406,8 +394,7 @@ func (s *StreamScheduler) createMainPipeline() error {
 	intervideo2.Link(videoQueue2)
 	videoQueue2.Link(s.compositor)
 	s.compositor.Link(videoMixerQueue)
-	videoMixerQueue.Link(videoconv)
-	videoconv.Link(h264enc)
+	videoMixerQueue.Link(h264enc)
 	h264enc.Link(muxerQueue)
 	muxerQueue.Link(mpegtsmux)
 
@@ -425,8 +412,7 @@ func (s *StreamScheduler) createMainPipeline() error {
 	audiocaps2.Link(audiomixer)
 
 	audiomixer.Link(audioMixerQueue)
-	audioMixerQueue.Link(audioconv)
-	audioconv.Link(aacenc)
+	audioMixerQueue.Link(aacenc)
 	aacenc.Link(mpegtsmux)
 
 	// Link muxer to RTP and UDP sink
