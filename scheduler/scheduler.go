@@ -348,38 +348,8 @@ func (s *StreamScheduler) createMainPipeline() error {
 		return fmt.Errorf("failed to create audioconv2: %v", err)
 	}
 
-	// Create audioresample elements to ensure rate compatibility
-	audioresample1, err := gst.NewElement("audioresample")
-	audioresample1.SetProperty("name", "audioresample1" + s.schedulerID)
-	if err != nil {
-		return fmt.Errorf("failed to create audioresample1: %v", err)
-	}
-
-	audioresample2, err := gst.NewElement("audioresample")
-	audioresample2.SetProperty("name", "audioresample2" + s.schedulerID)
-	if err != nil {
-		return fmt.Errorf("failed to create audioresample2: %v", err)
-	}
-
-	// Create capsfilters to explicitly set audio format
-	audiocaps1, err := gst.NewElementWithProperties("capsfilter", map[string]interface{}{
-		"caps": gst.NewCapsFromString("audio/x-raw, format=S16LE, layout=interleaved, rate=48000, channels=2"),
-		"name": "audiocaps1" + s.schedulerID,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to create audiocaps1: %v", err)
-	}
-
-	audiocaps2, err := gst.NewElementWithProperties("capsfilter", map[string]interface{}{
-		"caps": gst.NewCapsFromString("audio/x-raw, format=S16LE, layout=interleaved, rate=48000, channels=2"),
-		"name": "audiocaps2" + s.schedulerID,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to create audiocaps2: %v", err)
-	}
-
 	// Add all new elements to the pipeline
-	pipeline.AddMany(audioconv1, audioconv2, audioresample1, audioresample2, audiocaps1, audiocaps2)
+	pipeline.AddMany(audioconv1, audioconv2)
 
 	// Add all elements to the pipeline
 	pipeline.AddMany(intervideo1, intervideo2, s.compositor, h264enc)
@@ -401,15 +371,11 @@ func (s *StreamScheduler) createMainPipeline() error {
 	// Link audio elements
 	interaudio1.Link(audioQueue1)
 	audioQueue1.Link(audioconv1)
-	audioconv1.Link(audioresample1)
-	audioresample1.Link(audiocaps1)
-	audiocaps1.Link(audiomixer)
+	audioconv1.Link(audiomixer)
 
 	interaudio2.Link(audioQueue2)
 	audioQueue2.Link(audioconv2)
-	audioconv2.Link(audioresample2)
-	audioresample2.Link(audiocaps2)
-	audiocaps2.Link(audiomixer)
+	audioconv2.Link(audiomixer)
 
 	audiomixer.Link(audioMixerQueue)
 	audioMixerQueue.Link(aacenc)
