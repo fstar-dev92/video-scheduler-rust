@@ -70,7 +70,7 @@ func main() {
 
 	streamScheduler1.AddItem(scheduler.StreamItem{
 		Type:     "file",
-		Source:   "/home/ubuntu/Dev/video-scheduler-gstreamer/videos/New_Filler.mp4", // Second video file
+		Source:   "/home/ubuntu/Dev/video-scheduler-gstreamer/videos/output-new-filler.mp4", // Second video file
 		Start:    now.Add(10 * time.Second),
 		Duration: 60 * time.Second,
 	})
