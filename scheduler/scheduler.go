@@ -335,22 +335,6 @@ func (s *StreamScheduler) createMainPipeline() error {
 		return fmt.Errorf("failed to create muxerQueue: %v", err)
 	}
 
-	// Create audio converter elements for each input
-	audioconv1, err := gst.NewElement("audioconvert")
-	audioconv1.SetProperty("name", "audioconv1" + s.schedulerID)
-	if err != nil {
-		return fmt.Errorf("failed to create audioconv1: %v", err)
-	}
-
-	audioconv2, err := gst.NewElement("audioconvert")
-	audioconv2.SetProperty("name", "audioconv2" + s.schedulerID)
-	if err != nil {
-		return fmt.Errorf("failed to create audioconv2: %v", err)
-	}
-
-	// Add all new elements to the pipeline
-	pipeline.AddMany(audioconv1, audioconv2)
-
 	// Add all elements to the pipeline
 	pipeline.AddMany(intervideo1, intervideo2, s.compositor, h264enc)
 	pipeline.AddMany(interaudio1, interaudio2, audiomixer, aacenc)
@@ -370,12 +354,10 @@ func (s *StreamScheduler) createMainPipeline() error {
 
 	// Link audio elements
 	interaudio1.Link(audioQueue1)
-	audioQueue1.Link(audioconv1)
-	audioconv1.Link(audiomixer)
+	audioQueue1.Link(audiomixer)
 
 	interaudio2.Link(audioQueue2)
-	audioQueue2.Link(audioconv2)
-	audioconv2.Link(audiomixer)
+	audioQueue2.Link(audiomixer)
 
 	audiomixer.Link(audioMixerQueue)
 	audioMixerQueue.Link(aacenc)
