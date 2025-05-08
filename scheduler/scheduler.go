@@ -312,23 +312,12 @@ func (s *StreamScheduler) createMainPipeline() error {
 		return fmt.Errorf("failed to create videoMixerQueue: %v", err)
 	}
 
-	audioMixerQueue, err := gst.NewElementWithProperties("queue", map[string]interface{}{
-		"max-size-buffers":   100,
-		"max-size-time":      uint64(500 * time.Millisecond),
-		"min-threshold-time": uint64(50 * time.Millisecond),
-		"leaky":              0, // No leaking
-		"name":               "audioMixerQueue" + s.schedulerID,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to create audioMixerQueue: %v", err)
-	}
-
 	// Add all elements to the pipeline
 	pipeline.AddMany(intervideo1, intervideo2, s.compositor, h264enc)
 	pipeline.AddMany(interaudio1, interaudio2, audiomixer, aacenc)
 	pipeline.AddMany(mpegtsmux, rtpmp2tpay, udpsink)
 	pipeline.AddMany(videoQueue1, videoQueue2, audioQueue1, audioQueue2)
-	pipeline.AddMany(videoMixerQueue, audioMixerQueue)
+	pipeline.Add(videoMixerQueue)
 
 	// Link video elements
 	intervideo1.Link(videoQueue1)
@@ -346,8 +335,7 @@ func (s *StreamScheduler) createMainPipeline() error {
 	interaudio2.Link(audioQueue2)
 	audioQueue2.Link(audiomixer)
 
-	audiomixer.Link(audioMixerQueue)
-	audioMixerQueue.Link(aacenc)
+	audiomixer.Link(aacenc)
 	aacenc.Link(mpegtsmux)
 
 	// Link muxer to RTP and UDP sink
