@@ -415,11 +415,6 @@ func (s *StreamScheduler) createSourcePipeline(item StreamItem, index int, chann
 		return nil, fmt.Errorf("failed to create audioconvert: %v", err)
 	}
 
-	audioresample, err := gst.NewElement("audioresample")
-	if err != nil {
-		return nil, fmt.Errorf("failed to create audioresample: %v", err)
-	}
-
 	audiocaps, err := gst.NewElementWithProperties("capsfilter", map[string]interface{}{
 		"caps": gst.NewCapsFromString("audio/x-raw, format=S16LE, layout=interleaved, rate=48000, channels=2"),
 		"name": "audiocaps" + s.schedulerID,
@@ -439,11 +434,10 @@ func (s *StreamScheduler) createSourcePipeline(item StreamItem, index int, chann
 	}
 
 	// Add elements to bin
-	audiobin.AddMany(audioconvert, audioresample, audiocaps, interaudiosink)
+	audiobin.AddMany(audioconvert, audiocaps, interaudiosink)
 
 	// Link elements in bin
-	audioconvert.Link(audioresample)
-	audioresample.Link(audiocaps)
+	audioconvert.Link(audiocaps)
 	audiocaps.Link(interaudiosink)
 
 	// Create and add ghost pad using the bin's method
