@@ -4,7 +4,7 @@ go 1.24.2
 
 require (
 	github.com/go-gst/go-gst v1.4.0
-	github.com/gotk3/gotk3 v0.6.4
+	github.com/google/uuid v1.6.0
 )
 
 require (
