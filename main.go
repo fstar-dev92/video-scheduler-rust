@@ -17,6 +17,11 @@ func main() {
 	// Initialize GStreamer
 	gst.Init(nil)
 
+	if len(os.Args) > 1 && os.Args[1] == "scte35" {
+		// Run SCTE-35 handler mode
+		runSCTE35Example()
+		return
+	}
 	// Create a new stream scheduler with output to localhost:5000
 	streamScheduler, err := scheduler.NewStreamScheduler("239.1.1.5", 5000)
 	if err != nil {

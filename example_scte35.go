@@ -11,11 +11,11 @@ import (
 
 func runSCTE35Example() {
 	// Example configuration
-	inputHost := "239.1.1.5"           // Input multicast address
-	inputPort := 5000                  // Input port for main stream
-	outputHost := "239.1.1.6"          // Output multicast address
-	outputPort := 5002                 // Output port for processed stream
-	adSource := "/path/to/your/ad.mp4" // Path to your ad file
+	inputHost := "239.0.0.1"                                                  // Input multicast address
+	inputPort := 5000                                                         // Input port for main stream
+	outputHost := "239.1.1.6"                                                 // Output multicast address
+	outputPort := 5002                                                        // Output port for processed stream
+	adSource := "/home/fstar/work/video-scheduler-gstreamer/videos/input.mp4" // Path to your ad file
 
 	// Create SCTE-35 handler
 	handler, err := NewAdInsertionHandler(inputHost, inputPort, outputHost, outputPort, adSource)

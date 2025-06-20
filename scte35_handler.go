@@ -3,8 +3,6 @@ package main
 import (
 	"encoding/binary"
 	"fmt"
-	"log"
-	"net"
 	"sync"
 	"time"
 
@@ -26,10 +24,9 @@ type SCTE35Message struct {
 	Tier                   uint16
 	SpliceCommandLength    uint16
 	SpliceCommandType      uint8
-	// Add more fields as needed for your specific SCTE-35 implementation
 }
 
-// AdInsertionHandler handles SCTE-35 messages and ad insertion
+// AdInsertionHandler handles SCTE-35 messages and ad insertion using compositor/audiomixer
 type AdInsertionHandler struct {
 	inputHost        string
 	inputPort        int
@@ -38,6 +35,8 @@ type AdInsertionHandler struct {
 	adSource         string
 	mainPipeline     *gst.Pipeline
 	adPipeline       *gst.Pipeline
+	compositor       *gst.Element
+	audiomixer       *gst.Element
 	mutex            sync.Mutex
 	stopChan         chan struct{}
 	running          bool
@@ -45,6 +44,7 @@ type AdInsertionHandler struct {
 	currentAdPlaying bool
 	adDuration       time.Duration
 	mainStreamPaused bool
+	scheduledAds     map[gst.ClockTime]bool // Track scheduled ad insertions
 }
 
 // NewAdInsertionHandler creates a new SCTE-35 handler
@@ -52,14 +52,15 @@ func NewAdInsertionHandler(inputHost string, inputPort int, outputHost string, o
 	gst.Init(nil)
 
 	return &AdInsertionHandler{
-		inputHost:  inputHost,
-		inputPort:  inputPort,
-		outputHost: outputHost,
-		outputPort: outputPort,
-		adSource:   adSource,
-		stopChan:   make(chan struct{}),
-		handlerID:  uuid.New().String(),
-		adDuration: 30 * time.Second, // Default ad duration
+		inputHost:    inputHost,
+		inputPort:    inputPort,
+		outputHost:   outputHost,
+		outputPort:   outputPort,
+		adSource:     adSource,
+		stopChan:     make(chan struct{}),
+		handlerID:    uuid.New().String(),
+		adDuration:   30 * time.Second, // Default ad duration
+		scheduledAds: make(map[gst.ClockTime]bool),
 	}, nil
 }
 
@@ -82,23 +83,20 @@ func (h *AdInsertionHandler) Start() error {
 	// Start the main pipeline
 	h.mainPipeline.SetState(gst.StatePlaying)
 
-	// Start UDP listener for SCTE-35 messages
-	go h.startUDPListener()
-
 	// Start monitoring goroutine
 	go h.monitorPipelines()
 
 	return nil
 }
 
-// createMainPipeline creates the main pipeline for normal stream processing
+// createMainPipeline creates the main pipeline with compositor and audiomixer
 func (h *AdInsertionHandler) createMainPipeline() error {
 	pipeline, err := gst.NewPipeline("main-pipeline" + h.handlerID)
 	if err != nil {
 		return fmt.Errorf("failed to create main pipeline: %v", err)
 	}
 
-	// Create UDP source
+	// Create UDP source for input RTP stream
 	udpsrc, err := gst.NewElementWithProperties("udpsrc", map[string]interface{}{
 		"host":           h.inputHost,
 		"port":           h.inputPort,
@@ -116,25 +114,98 @@ func (h *AdInsertionHandler) createMainPipeline() error {
 		return fmt.Errorf("failed to create rtpmp2tdepay: %v", err)
 	}
 
-	// Create demuxer
-	demux, err := gst.NewElement("tsdemux")
+	// Create demuxer for main stream processing with SCTE-35 event forwarding
+	demux, err := gst.NewElementWithProperties("tsdemux", map[string]interface{}{
+		"send-scte35-events": true, // Enable SCTE-35 event forwarding
+		"name":               "tsdemux" + h.handlerID,
+	})
 	if err != nil {
 		return fmt.Errorf("failed to create tsdemux: %v", err)
 	}
 
-	// Create video and audio parsers
-	videoParser, err := gst.NewElement("h264parse")
+	// Create intervideosrc for main stream (input1)
+	intervideo1, err := gst.NewElementWithProperties("intervideosrc", map[string]interface{}{
+		"channel":      "input1" + h.handlerID,
+		"do-timestamp": true,
+		"name":         "intervideosrc1" + h.handlerID,
+	})
 	if err != nil {
-		return fmt.Errorf("failed to create h264parse: %v", err)
+		return fmt.Errorf("failed to create intervideosrc1: %v", err)
 	}
 
-	audioParser, err := gst.NewElement("aacparse")
+	// Create intervideosrc for ad stream (input2)
+	intervideo2, err := gst.NewElementWithProperties("intervideosrc", map[string]interface{}{
+		"channel":      "input2" + h.handlerID,
+		"do-timestamp": true,
+		"name":         "intervideosrc2" + h.handlerID,
+	})
 	if err != nil {
-		return fmt.Errorf("failed to create aacparse: %v", err)
+		return fmt.Errorf("failed to create intervideosrc2: %v", err)
 	}
 
-	// Create video and audio encoders
-	videoEnc, err := gst.NewElementWithProperties("x264enc", map[string]interface{}{
+	// Create video mixer (compositor)
+	h.compositor, err = gst.NewElementWithProperties("compositor", map[string]interface{}{
+		"background":            1, // black background
+		"zero-size-is-unscaled": true,
+		"name":                  "compositor" + h.handlerID,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create compositor: %v", err)
+	}
+
+	// Configure compositor sink pads for proper positioning
+	pad1 := h.compositor.GetStaticPad("sink_0")
+	if pad1 != nil {
+		pad1.SetProperty("xpos", 0)
+		pad1.SetProperty("ypos", 0)
+		pad1.SetProperty("width", 1920)
+		pad1.SetProperty("height", 1080)
+		pad1.SetProperty("alpha", 1.0) // input1 visible
+	}
+
+	pad2 := h.compositor.GetStaticPad("sink_1")
+	if pad2 != nil {
+		pad2.SetProperty("xpos", 0)
+		pad2.SetProperty("ypos", 0)
+		pad2.SetProperty("width", 1920)
+		pad2.SetProperty("height", 1080)
+		pad2.SetProperty("alpha", 0.0) // input2 hidden
+	}
+
+	// Create interaudiosrc for main stream (audio1)
+	interaudio1, err := gst.NewElementWithProperties("interaudiosrc", map[string]interface{}{
+		"channel":      "audio1" + h.handlerID,
+		"do-timestamp": true,
+		"name":         "interaudiosrc1" + h.handlerID,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create interaudiosrc1: %v", err)
+	}
+
+	// Create interaudiosrc for ad stream (audio2)
+	interaudio2, err := gst.NewElementWithProperties("interaudiosrc", map[string]interface{}{
+		"channel":      "audio2" + h.handlerID,
+		"do-timestamp": true,
+		"name":         "interaudiosrc2" + h.handlerID,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create interaudiosrc2: %v", err)
+	}
+
+	// Create audio mixer
+	h.audiomixer, err = gst.NewElement("audiomixer")
+	h.audiomixer.SetProperty("name", "audiomixer"+h.handlerID)
+	if err != nil {
+		return fmt.Errorf("failed to create audiomixer: %v", err)
+	}
+
+	// Create video converter and encoder
+	videoconv, err := gst.NewElement("videoconvert")
+	if err != nil {
+		return fmt.Errorf("failed to create videoconvert: %v", err)
+	}
+
+	h264enc, err := gst.NewElementWithProperties("x264enc", map[string]interface{}{
 		"tune":    0x00000004, // zerolatency
 		"bitrate": 2000,       // 2 Mbps
 		"name":    "h264enc" + h.handlerID,
@@ -143,7 +214,14 @@ func (h *AdInsertionHandler) createMainPipeline() error {
 		return fmt.Errorf("failed to create h264enc: %v", err)
 	}
 
-	audioEnc, err := gst.NewElementWithProperties("avenc_aac", map[string]interface{}{
+	// Create audio converter and encoder
+	audioconv, err := gst.NewElement("audioconvert")
+	audioconv.SetProperty("name", "audioconv"+h.handlerID)
+	if err != nil {
+		return fmt.Errorf("failed to create audioconvert: %v", err)
+	}
+
+	aacenc, err := gst.NewElementWithProperties("avenc_aac", map[string]interface{}{
 		"bitrate": 128000,
 		"name":    "aacenc" + h.handlerID,
 	})
@@ -151,8 +229,8 @@ func (h *AdInsertionHandler) createMainPipeline() error {
 		return fmt.Errorf("failed to create aacenc: %v", err)
 	}
 
-	// Create muxer
-	muxer, err := gst.NewElementWithProperties("mpegtsmux", map[string]interface{}{
+	// Create muxer and RTP elements
+	mpegtsmux, err := gst.NewElementWithProperties("mpegtsmux", map[string]interface{}{
 		"alignment":    7,
 		"pat-interval": int64(100 * 1000000),
 		"pmt-interval": int64(100 * 1000000),
@@ -163,8 +241,7 @@ func (h *AdInsertionHandler) createMainPipeline() error {
 		return fmt.Errorf("failed to create mpegtsmux: %v", err)
 	}
 
-	// Create RTP payloader
-	rtppay, err := gst.NewElementWithProperties("rtpmp2tpay", map[string]interface{}{
+	rtpmp2tpay, err := gst.NewElementWithProperties("rtpmp2tpay", map[string]interface{}{
 		"pt":              33,
 		"mtu":             1400,
 		"perfect-rtptime": true,
@@ -174,7 +251,6 @@ func (h *AdInsertionHandler) createMainPipeline() error {
 		return fmt.Errorf("failed to create rtpmp2tpay: %v", err)
 	}
 
-	// Create UDP sink
 	udpsink, err := gst.NewElementWithProperties("udpsink", map[string]interface{}{
 		"host":           h.outputHost,
 		"port":           h.outputPort,
@@ -187,8 +263,135 @@ func (h *AdInsertionHandler) createMainPipeline() error {
 		return fmt.Errorf("failed to create udpsink: %v", err)
 	}
 
-	// Add elements to pipeline
-	pipeline.AddMany(udpsrc, rtpdepay, demux, videoParser, audioParser, videoEnc, audioEnc, muxer, rtppay, udpsink)
+	// Create queues for latency management
+	videoQueue1, err := gst.NewElementWithProperties("queue", map[string]interface{}{
+		"max-size-buffers":   100,
+		"max-size-time":      uint64(500 * time.Millisecond),
+		"min-threshold-time": uint64(50 * time.Millisecond),
+		"leaky":              0,
+		"name":               "videoQueue1" + h.handlerID,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create videoQueue1: %v", err)
+	}
+
+	videoQueue2, err := gst.NewElementWithProperties("queue", map[string]interface{}{
+		"max-size-buffers":   100,
+		"max-size-time":      uint64(500 * time.Millisecond),
+		"min-threshold-time": uint64(50 * time.Millisecond),
+		"leaky":              0,
+		"name":               "videoQueue2" + h.handlerID,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create videoQueue2: %v", err)
+	}
+
+	audioQueue1, err := gst.NewElementWithProperties("queue", map[string]interface{}{
+		"max-size-buffers":   100,
+		"max-size-time":      uint64(500 * time.Millisecond),
+		"min-threshold-time": uint64(50 * time.Millisecond),
+		"leaky":              0,
+		"name":               "audioQueue1" + h.handlerID,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create audioQueue1: %v", err)
+	}
+
+	audioQueue2, err := gst.NewElementWithProperties("queue", map[string]interface{}{
+		"max-size-buffers":   100,
+		"max-size-time":      uint64(500 * time.Millisecond),
+		"min-threshold-time": uint64(50 * time.Millisecond),
+		"leaky":              0,
+		"name":               "audioQueue2" + h.handlerID,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create audioQueue2: %v", err)
+	}
+
+	videoMixerQueue, err := gst.NewElementWithProperties("queue", map[string]interface{}{
+		"max-size-buffers":   100,
+		"max-size-time":      uint64(500 * time.Millisecond),
+		"min-threshold-time": uint64(50 * time.Millisecond),
+		"leaky":              0,
+		"name":               "videoMixerQueue" + h.handlerID,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create videoMixerQueue: %v", err)
+	}
+
+	audioMixerQueue, err := gst.NewElementWithProperties("queue", map[string]interface{}{
+		"max-size-buffers":   100,
+		"max-size-time":      uint64(500 * time.Millisecond),
+		"min-threshold-time": uint64(50 * time.Millisecond),
+		"leaky":              0,
+		"name":               "audioMixerQueue" + h.handlerID,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create audioMixerQueue: %v", err)
+	}
+
+	muxerQueue, err := gst.NewElementWithProperties("queue", map[string]interface{}{
+		"max-size-buffers":   200,
+		"max-size-time":      uint64(1 * time.Second),
+		"min-threshold-time": uint64(100 * time.Millisecond),
+		"leaky":              0,
+		"name":               "muxerQueue" + h.handlerID,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create muxerQueue: %v", err)
+	}
+
+	// Create audio converter elements for each input
+	audioconv1, err := gst.NewElement("audioconvert")
+	audioconv1.SetProperty("name", "audioconv1"+h.handlerID)
+	if err != nil {
+		return fmt.Errorf("failed to create audioconv1: %v", err)
+	}
+
+	audioconv2, err := gst.NewElement("audioconvert")
+	audioconv2.SetProperty("name", "audioconv2"+h.handlerID)
+	if err != nil {
+		return fmt.Errorf("failed to create audioconv2: %v", err)
+	}
+
+	// Create audioresample elements
+	audioresample1, err := gst.NewElement("audioresample")
+	audioresample1.SetProperty("name", "audioresample1"+h.handlerID)
+	if err != nil {
+		return fmt.Errorf("failed to create audioresample1: %v", err)
+	}
+
+	audioresample2, err := gst.NewElement("audioresample")
+	audioresample2.SetProperty("name", "audioresample2"+h.handlerID)
+	if err != nil {
+		return fmt.Errorf("failed to create audioresample2: %v", err)
+	}
+
+	// Create capsfilters for audio format
+	audiocaps1, err := gst.NewElementWithProperties("capsfilter", map[string]interface{}{
+		"caps": gst.NewCapsFromString("audio/x-raw, format=S16LE, layout=interleaved, rate=48000, channels=2"),
+		"name": "audiocaps1" + h.handlerID,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create audiocaps1: %v", err)
+	}
+
+	audiocaps2, err := gst.NewElementWithProperties("capsfilter", map[string]interface{}{
+		"caps": gst.NewCapsFromString("audio/x-raw, format=S16LE, layout=interleaved, rate=48000, channels=2"),
+		"name": "audiocaps2" + h.handlerID,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create audiocaps2: %v", err)
+	}
+
+	// Add all elements to the pipeline
+	pipeline.AddMany(udpsrc, rtpdepay, demux)
+	pipeline.AddMany(intervideo1, intervideo2, h.compositor, videoconv, h264enc)
+	pipeline.AddMany(interaudio1, interaudio2, h.audiomixer, audioconv, aacenc)
+	pipeline.AddMany(mpegtsmux, rtpmp2tpay, udpsink)
+	pipeline.AddMany(videoQueue1, videoQueue2, audioQueue1, audioQueue2)
+	pipeline.AddMany(videoMixerQueue, audioMixerQueue, muxerQueue)
+	pipeline.AddMany(audioconv1, audioconv2, audioresample1, audioresample2, audiocaps1, audiocaps2)
 
 	// Link elements
 	udpsrc.Link(rtpdepay)
@@ -200,21 +403,84 @@ func (h *AdInsertionHandler) createMainPipeline() error {
 		fmt.Printf("Dynamic pad added: %s\n", padName)
 
 		if padName == "video_0" {
-			// Link video pad
-			pad.Link(videoParser.GetStaticPad("sink"))
-			videoParser.Link(videoEnc)
-			videoEnc.Link(muxer)
+			// Link video pad to intervideosink
+			intervideosink, err := gst.NewElementWithProperties("intervideosink", map[string]interface{}{
+				"channel": "input1" + h.handlerID,
+				"sync":    true,
+			})
+			if err != nil {
+				fmt.Printf("Failed to create intervideosink: %v\n", err)
+				return
+			}
+			pipeline.Add(intervideosink)
+			pad.Link(intervideosink.GetStaticPad("sink"))
 		} else if padName == "audio_0" {
-			// Link audio pad
-			pad.Link(audioParser.GetStaticPad("sink"))
-			audioParser.Link(audioEnc)
-			audioEnc.Link(muxer)
+			// Link audio pad to interaudiosink
+			interaudiosink, err := gst.NewElementWithProperties("interaudiosink", map[string]interface{}{
+				"channel": "audio1" + h.handlerID,
+				"sync":    true,
+			})
+			if err != nil {
+				fmt.Printf("Failed to create interaudiosink: %v\n", err)
+				return
+			}
+			pipeline.Add(interaudiosink)
+			pad.Link(interaudiosink.GetStaticPad("sink"))
 		}
 	})
 
-	// Link muxer to output
-	muxer.Link(rtppay)
-	rtppay.Link(udpsink)
+	// Set up SCTE-35 signal connection on demuxer
+	demux.Connect("scte35", func(element *gst.Element, buffer *gst.Buffer) {
+		fmt.Println("Received SCTE-35 event!")
+
+		// Get current pipeline time for scheduling
+		currentPTS := h.getCurrentPTS()
+
+		fmt.Printf("SCTE-35 event at pipeline time: %v\n", currentPTS)
+
+		// Map the buffer to access raw data
+		data := buffer.Map(gst.MapRead)
+		if err != nil {
+			fmt.Println("Failed to map buffer:", err)
+			return
+		}
+
+		fmt.Printf("SCTE-35 Raw Data: %x\n", data.Bytes())
+
+		// Parse SCTE-35 message and handle with current time
+		h.handleSCTE35EventWithPTS(data.Bytes(), uint64(currentPTS), 0)
+	})
+
+	// Link video elements
+	intervideo1.Link(videoQueue1)
+	videoQueue1.Link(h.compositor)
+	intervideo2.Link(videoQueue2)
+	videoQueue2.Link(h.compositor)
+	h.compositor.Link(videoMixerQueue)
+	videoMixerQueue.Link(videoconv)
+	videoconv.Link(h264enc)
+	h264enc.Link(muxerQueue)
+
+	// Link audio elements
+	interaudio1.Link(audioQueue1)
+	audioQueue1.Link(audioconv1)
+	audioconv1.Link(audioresample1)
+	audioresample1.Link(audiocaps1)
+	audiocaps1.Link(h.audiomixer)
+
+	interaudio2.Link(audioQueue2)
+	audioQueue2.Link(audioconv2)
+	audioresample2.Link(audiocaps2)
+	audiocaps2.Link(h.audiomixer)
+
+	h.audiomixer.Link(audioMixerQueue)
+	audioMixerQueue.Link(audioconv)
+	audioconv.Link(aacenc)
+	aacenc.Link(mpegtsmux)
+
+	// Link muxer to RTP and UDP sink
+	mpegtsmux.Link(rtpmp2tpay)
+	rtpmp2tpay.Link(udpsink)
 
 	// Set up bus watch
 	bus := pipeline.GetBus()
@@ -259,7 +525,7 @@ func (h *AdInsertionHandler) createAdPipeline() error {
 
 	// Create video sink
 	intervideosink, err := gst.NewElementWithProperties("intervideosink", map[string]interface{}{
-		"channel": "ad-video" + h.handlerID,
+		"channel": "input2" + h.handlerID,
 		"sync":    true,
 	})
 	if err != nil {
@@ -268,7 +534,7 @@ func (h *AdInsertionHandler) createAdPipeline() error {
 
 	// Create audio sink
 	interaudiosink, err := gst.NewElementWithProperties("interaudiosink", map[string]interface{}{
-		"channel": "ad-audio" + h.handlerID,
+		"channel": "audio2" + h.handlerID,
 		"sync":    true,
 	})
 	if err != nil {
@@ -307,47 +573,71 @@ func (h *AdInsertionHandler) createAdPipeline() error {
 	return nil
 }
 
-// startUDPListener starts listening for SCTE-35 messages on UDP
-func (h *AdInsertionHandler) startUDPListener() {
-	addr := fmt.Sprintf("%s:%d", h.inputHost, h.inputPort+1000) // Use different port for SCTE-35
-	conn, err := net.ListenUDP("udp", &net.UDPAddr{
-		IP:   net.ParseIP(h.inputHost),
-		Port: h.inputPort + 1000,
-	})
-	if err != nil {
-		log.Printf("Failed to listen for SCTE-35 messages: %v", err)
+// handleSCTE35Event handles SCTE-35 events detected from the stream
+func (h *AdInsertionHandler) handleSCTE35Event(event *gst.Event) {
+	fmt.Printf("Handling SCTE-35 event\n")
+
+	// For now, we'll trigger ad insertion on any event
+	// In a real implementation, you would parse the event data to extract SCTE-35 information
+	fmt.Printf("SCTE-35 event detected - inserting ad\n")
+	h.insertAd()
+}
+
+// handleSCTE35EventWithPTS handles SCTE-35 events with PTS timing information
+func (h *AdInsertionHandler) handleSCTE35EventWithPTS(data []byte, pts uint64, duration uint64) {
+
+	// Parse SCTE-35 message
+	message := h.parseSCTE35Message(data)
+	if message == nil {
+		fmt.Println("Failed to parse SCTE-35 message")
 		return
 	}
-	defer conn.Close()
 
-	fmt.Printf("Listening for SCTE-35 messages on %s\n", addr)
+	fmt.Printf("SCTE-35 Command Type: %d\n", message.SpliceCommandType)
 
-	buffer := make([]byte, 4096)
-	for h.running {
-		n, _, err := conn.ReadFromUDP(buffer)
-		if err != nil {
-			if h.running {
-				log.Printf("Error reading SCTE-35 message: %v", err)
-			}
-			continue
-		}
-
-		// Parse SCTE-35 message
-		message := h.parseSCTE35Message(buffer[:n])
-		if message != nil {
-			h.handleSCTE35Message(message)
-		}
+	switch message.SpliceCommandType {
+	case 0x05: // Splice Insert
+		fmt.Printf("Splice Insert command detected - scheduling ad insertion\n")
+		h.scheduleAdInsertion(message.PTSAdjustment, message)
+	case 0x06: // Splice Null
+		fmt.Printf("Splice Null command detected\n")
+	case 0x07: // Splice Schedule
+		fmt.Printf("Splice Schedule command detected - scheduling ad insertion\n")
+		h.scheduleAdInsertion(message.PTSAdjustment, message)
+	default:
+		fmt.Printf("Unknown SCTE-35 command type: %d\n", message.SpliceCommandType)
 	}
 }
 
-// parseSCTE35Message parses a SCTE-35 message from UDP data
+// scheduleAdInsertion schedules ad insertion at the correct PTS time
+func (h *AdInsertionHandler) scheduleAdInsertion(pts uint64, message *SCTE35Message) {
+	// Get current PTS from pipeline
+	currentPTS := h.getCurrentPTS()
+
+	// Convert PTS to time.Duration (PTS is in 90kHz clock units)
+	ptsDuration := h.convertPTSToDuration(pts)
+
+	// Calculate when to insert the ad based on PTS adjustment
+	// PTS adjustment is the offset from the current PTS to when the splice should occur
+	ptsAdjustmentDuration := h.convertPTSToDuration(message.PTSAdjustment)
+	insertTime := ptsDuration + ptsAdjustmentDuration
+
+	fmt.Printf("Scheduling ad insertion - Current PTS: %v, Event PTS: %v, PTS Adjustment: %v, Insert Time: %v\n",
+		currentPTS, pts, message.PTSAdjustment, insertTime)
+
+	// Schedule the ad insertion
+	time.AfterFunc(insertTime, func() {
+		h.insertAd()
+	})
+}
+
+// parseSCTE35Message parses a SCTE-35 message from raw data
 func (h *AdInsertionHandler) parseSCTE35Message(data []byte) *SCTE35Message {
 	if len(data) < 8 {
 		return nil
 	}
 
-	// Basic SCTE-35 parsing (simplified)
-	// In a real implementation, you would need more sophisticated parsing
+	// Basic SCTE-35 parsing
 	message := &SCTE35Message{
 		TableID:                data[0],
 		SectionSyntaxIndicator: (data[1] & 0x80) != 0,
@@ -356,7 +646,7 @@ func (h *AdInsertionHandler) parseSCTE35Message(data []byte) *SCTE35Message {
 	}
 
 	// Check if this is a SCTE-35 splice insert command
-	if len(data) >= 14 && data[0] == 0xFC { // SCTE-35 table ID
+	if len(data) >= 19 && data[0] == 0xFC { // SCTE-35 table ID
 		message.ProtocolVersion = data[3]
 		message.EncryptedPacket = (data[4] & 0x80) != 0
 		message.EncryptionAlgorithm = data[4] & 0x3F
@@ -372,27 +662,7 @@ func (h *AdInsertionHandler) parseSCTE35Message(data []byte) *SCTE35Message {
 	return nil
 }
 
-// handleSCTE35Message handles a parsed SCTE-35 message
-func (h *AdInsertionHandler) handleSCTE35Message(message *SCTE35Message) {
-	fmt.Printf("Received SCTE-35 message: TableID=%d, CommandType=%d\n",
-		message.TableID, message.SpliceCommandType)
-
-	// Handle different SCTE-35 command types
-	switch message.SpliceCommandType {
-	case 0x05: // Splice Insert
-		fmt.Printf("Splice Insert command received - inserting ad\n")
-		h.insertAd()
-	case 0x06: // Splice Null
-		fmt.Printf("Splice Null command received\n")
-	case 0x07: // Splice Schedule
-		fmt.Printf("Splice Schedule command received\n")
-		h.insertAd()
-	default:
-		fmt.Printf("Unknown SCTE-35 command type: %d\n", message.SpliceCommandType)
-	}
-}
-
-// insertAd starts playing an ad
+// insertAd starts playing an ad using compositor/audiomixer switching
 func (h *AdInsertionHandler) insertAd() {
 	h.mutex.Lock()
 	defer h.mutex.Unlock()
@@ -402,28 +672,34 @@ func (h *AdInsertionHandler) insertAd() {
 		return
 	}
 
-	fmt.Printf("Starting ad insertion\n")
-
-	// Pause main stream
+	// Get current pipeline time for logging
+	var currentTime gst.ClockTime
 	if h.mainPipeline != nil {
-		h.mainPipeline.SetState(gst.StatePaused)
-		h.mainStreamPaused = true
+		clock := h.mainPipeline.GetClock()
+		if clock != nil {
+			currentTime = clock.GetTime()
+		}
 	}
+
+	fmt.Printf("Starting ad insertion at pipeline time: %v\n", currentTime)
 
 	// Create and start ad pipeline
 	err := h.createAdPipeline()
 	if err != nil {
 		fmt.Printf("Failed to create ad pipeline: %v\n", err)
-		// Resume main stream
-		if h.mainPipeline != nil {
-			h.mainPipeline.SetState(gst.StatePlaying)
-			h.mainStreamPaused = false
-		}
 		return
 	}
 
 	h.adPipeline.SetState(gst.StatePlaying)
 	h.currentAdPlaying = true
+
+	// Switch compositor to show ad (input2)
+	pad1 := h.compositor.GetStaticPad("sink_0")
+	pad2 := h.compositor.GetStaticPad("sink_1")
+	if pad1 != nil && pad2 != nil {
+		pad1.SetProperty("alpha", 0.0) // Hide input1 (main stream)
+		pad2.SetProperty("alpha", 1.0) // Show input2 (ad)
+	}
 
 	// Set up timer to stop ad after duration
 	time.AfterFunc(h.adDuration, func() {
@@ -440,7 +716,16 @@ func (h *AdInsertionHandler) stopAd() {
 		return
 	}
 
-	fmt.Printf("Stopping ad\n")
+	// Get current pipeline time for logging
+	var currentTime gst.ClockTime
+	if h.mainPipeline != nil {
+		clock := h.mainPipeline.GetClock()
+		if clock != nil {
+			currentTime = clock.GetTime()
+		}
+	}
+
+	fmt.Printf("Stopping ad at pipeline time: %v\n", currentTime)
 
 	// Stop ad pipeline
 	if h.adPipeline != nil {
@@ -450,10 +735,12 @@ func (h *AdInsertionHandler) stopAd() {
 
 	h.currentAdPlaying = false
 
-	// Resume main stream
-	if h.mainPipeline != nil && h.mainStreamPaused {
-		h.mainPipeline.SetState(gst.StatePlaying)
-		h.mainStreamPaused = false
+	// Switch compositor back to main stream (input1)
+	pad1 := h.compositor.GetStaticPad("sink_0")
+	pad2 := h.compositor.GetStaticPad("sink_1")
+	if pad1 != nil && pad2 != nil {
+		pad1.SetProperty("alpha", 1.0) // Show input1 (main stream)
+		pad2.SetProperty("alpha", 0.0) // Hide input2 (ad)
 	}
 }
 
@@ -528,4 +815,25 @@ func (h *AdInsertionHandler) SetAdDuration(duration time.Duration) {
 	h.mutex.Lock()
 	defer h.mutex.Unlock()
 	h.adDuration = duration
+}
+
+// getCurrentPTS gets the current PTS from the pipeline
+func (h *AdInsertionHandler) getCurrentPTS() gst.ClockTime {
+	if h.mainPipeline == nil {
+		return gst.ClockTimeNone
+	}
+
+	clock := h.mainPipeline.GetClock()
+	if clock == nil {
+		return gst.ClockTimeNone
+	}
+
+	return clock.GetTime()
+}
+
+// convertPTSToDuration converts PTS (90kHz clock) to time.Duration
+func (h *AdInsertionHandler) convertPTSToDuration(pts uint64) time.Duration {
+	// PTS is in 90kHz clock units
+	// 90kHz = 90,000 Hz = 11.111... microseconds per PTS unit
+	return time.Duration(pts) * 11111 * time.Nanosecond / 1000000
 }
