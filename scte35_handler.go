@@ -98,7 +98,7 @@ func (h *AdInsertionHandler) createMainPipeline() error {
 
 	// Create UDP source for input RTP stream
 	udpsrc, err := gst.NewElementWithProperties("udpsrc", map[string]interface{}{
-		"host":           h.inputHost,
+		"address":        h.inputHost,
 		"port":           h.inputPort,
 		"buffer-size":    524288,
 		"auto-multicast": true,
@@ -116,8 +116,7 @@ func (h *AdInsertionHandler) createMainPipeline() error {
 
 	// Create demuxer for main stream processing with SCTE-35 event forwarding
 	demux, err := gst.NewElementWithProperties("tsdemux", map[string]interface{}{
-		"send-scte35-events": true, // Enable SCTE-35 event forwarding
-		"name":               "tsdemux" + h.handlerID,
+		"name": "tsdemux" + h.handlerID,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create tsdemux: %v", err)
@@ -385,7 +384,18 @@ func (h *AdInsertionHandler) createMainPipeline() error {
 	}
 
 	// Add all elements to the pipeline
-	pipeline.AddMany(udpsrc, rtpdepay, demux)
+	rtpCaps := gst.NewCapsFromString("application/x-rtp, media=video, clock-rate=90000, encoding-name=MP2T, payload=33")
+	capsfilter, err := gst.NewElementWithProperties("capsfilter", map[string]interface{}{
+		"caps": rtpCaps,
+		"name": "rtpCapsFilter" + h.handlerID,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create capsfilter: %v", err)
+	}
+	pipeline.Add(capsfilter)
+	udpsrc.Link(capsfilter)
+	capsfilter.Link(rtpdepay)
+	pipeline.AddMany(demux)
 	pipeline.AddMany(intervideo1, intervideo2, h.compositor, videoconv, h264enc)
 	pipeline.AddMany(interaudio1, interaudio2, h.audiomixer, audioconv, aacenc)
 	pipeline.AddMany(mpegtsmux, rtpmp2tpay, udpsink)
@@ -393,8 +403,29 @@ func (h *AdInsertionHandler) createMainPipeline() error {
 	pipeline.AddMany(videoMixerQueue, audioMixerQueue, muxerQueue)
 	pipeline.AddMany(audioconv1, audioconv2, audioresample1, audioresample2, audiocaps1, audiocaps2)
 
+	// Create intervideosink and interaudiosink elements upfront
+	intervideosink1, err := gst.NewElementWithProperties("intervideosink", map[string]interface{}{
+		"channel": "input1" + h.handlerID,
+		"sync":    true,
+		"name":    "intervideosink1" + h.handlerID,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create intervideosink1: %v", err)
+	}
+
+	interaudiosink1, err := gst.NewElementWithProperties("interaudiosink", map[string]interface{}{
+		"channel": "audio1" + h.handlerID,
+		"sync":    true,
+		"name":    "interaudiosink1" + h.handlerID,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create interaudiosink1: %v", err)
+	}
+
+	// Add the sink elements to pipeline
+	pipeline.AddMany(intervideosink1, interaudiosink1)
+
 	// Link elements
-	udpsrc.Link(rtpdepay)
 	rtpdepay.Link(demux)
 
 	// Set up dynamic pad-added signal for demuxer
@@ -403,52 +434,22 @@ func (h *AdInsertionHandler) createMainPipeline() error {
 		fmt.Printf("Dynamic pad added: %s\n", padName)
 
 		if padName == "video_0" {
-			// Link video pad to intervideosink
-			intervideosink, err := gst.NewElementWithProperties("intervideosink", map[string]interface{}{
-				"channel": "input1" + h.handlerID,
-				"sync":    true,
-			})
-			if err != nil {
-				fmt.Printf("Failed to create intervideosink: %v\n", err)
-				return
+			// Link video pad to existing intervideosink
+			result := pad.Link(intervideosink1.GetStaticPad("sink"))
+			if result != gst.PadLinkOK {
+				fmt.Printf("Failed to link video pad: %v\n", result)
+			} else {
+				fmt.Printf("Successfully linked video pad to intervideosink\n")
 			}
-			pipeline.Add(intervideosink)
-			pad.Link(intervideosink.GetStaticPad("sink"))
 		} else if padName == "audio_0" {
-			// Link audio pad to interaudiosink
-			interaudiosink, err := gst.NewElementWithProperties("interaudiosink", map[string]interface{}{
-				"channel": "audio1" + h.handlerID,
-				"sync":    true,
-			})
-			if err != nil {
-				fmt.Printf("Failed to create interaudiosink: %v\n", err)
-				return
+			// Link audio pad to existing interaudiosink
+			result := pad.Link(interaudiosink1.GetStaticPad("sink"))
+			if result != gst.PadLinkOK {
+				fmt.Printf("Failed to link audio pad: %v\n", result)
+			} else {
+				fmt.Printf("Successfully linked audio pad to interaudiosink\n")
 			}
-			pipeline.Add(interaudiosink)
-			pad.Link(interaudiosink.GetStaticPad("sink"))
 		}
-	})
-
-	// Set up SCTE-35 signal connection on demuxer
-	demux.Connect("scte35", func(element *gst.Element, buffer *gst.Buffer) {
-		fmt.Println("Received SCTE-35 event!")
-
-		// Get current pipeline time for scheduling
-		currentPTS := h.getCurrentPTS()
-
-		fmt.Printf("SCTE-35 event at pipeline time: %v\n", currentPTS)
-
-		// Map the buffer to access raw data
-		data := buffer.Map(gst.MapRead)
-		if err != nil {
-			fmt.Println("Failed to map buffer:", err)
-			return
-		}
-
-		fmt.Printf("SCTE-35 Raw Data: %x\n", data.Bytes())
-
-		// Parse SCTE-35 message and handle with current time
-		h.handleSCTE35EventWithPTS(data.Bytes(), uint64(currentPTS), 0)
 	})
 
 	// Link video elements
@@ -470,6 +471,7 @@ func (h *AdInsertionHandler) createMainPipeline() error {
 
 	interaudio2.Link(audioQueue2)
 	audioQueue2.Link(audioconv2)
+	audioconv2.Link(audioresample2)
 	audioresample2.Link(audiocaps2)
 	audiocaps2.Link(h.audiomixer)
 
@@ -494,12 +496,42 @@ func (h *AdInsertionHandler) createMainPipeline() error {
 			switch msg.Type() {
 			case gst.MessageError:
 				gerr := msg.ParseError()
-				fmt.Printf("Error from element %s: %s\n", msg.Source(), gerr.Error())
+				elementName := msg.Source()
+				fmt.Printf("Error from element %s: %s\n", elementName, gerr.Error())
+
+				// Handle specific inter element errors
+				if elementName == "intervideosrc1"+h.handlerID || elementName == "intervideosrc2"+h.handlerID {
+					fmt.Printf("Video inter source error - this may be normal during startup\n")
+				} else if elementName == "interaudiosrc1"+h.handlerID || elementName == "interaudiosrc2"+h.handlerID {
+					fmt.Printf("Audio inter source error - this may be normal during startup\n")
+				}
+
 			case gst.MessageWarning:
 				gerr := msg.ParseWarning()
 				fmt.Printf("Warning from element %s: %s\n", msg.Source(), gerr.Error())
 			case gst.MessageEOS:
 				fmt.Printf("End of stream received\n")
+			case gst.MessageElement:
+				// Handle element messages (which include SCTE-35 events)
+				structure := msg.GetStructure()
+				if structure != nil && structure.Name() == "scte35" {
+					fmt.Println("Received SCTE-35 event via bus message!")
+
+					// Get current pipeline time for scheduling
+					currentPTS := h.getCurrentPTS()
+					fmt.Printf("SCTE-35 event at pipeline time: %v\n", currentPTS)
+
+					// For now, just trigger ad insertion when SCTE-35 is detected
+					// In a real implementation, you would parse the structure data
+					fmt.Printf("SCTE-35 structure: %v\n", structure)
+					h.insertAd()
+				}
+			case gst.MessageStateChanged:
+				// Log state changes for debugging
+				_, newState := msg.ParseStateChanged()
+				if newState == gst.StatePlaying {
+					fmt.Printf("Element %s is now PLAYING\n", msg.Source())
+				}
 			}
 		}
 	}()
