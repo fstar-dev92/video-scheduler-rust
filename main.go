@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -14,12 +15,31 @@ import (
 )
 
 func main() {
+	// Parse command line flags
+	var verbose bool
+	flag.BoolVar(&verbose, "v", false, "Enable verbose logging")
+	flag.Parse()
+
 	// Initialize GStreamer
 	gst.Init(nil)
 
 	if len(os.Args) > 1 && os.Args[1] == "scte35" {
+		// Check for help flag
+		if len(os.Args) > 2 && (os.Args[2] == "-h" || os.Args[2] == "--help") {
+			fmt.Println("SCTE-35 Handler Usage:")
+			fmt.Println("  go run . scte35 [-v]")
+			fmt.Println("")
+			fmt.Println("Options:")
+			fmt.Println("  -v    Enable verbose logging and GStreamer debug output (like gst-launch-1.0 -v)")
+			fmt.Println("  -h    Show this help message")
+			fmt.Println("")
+			fmt.Println("Examples:")
+			fmt.Println("  go run . scte35          # Run with normal logging")
+			fmt.Println("  go run . scte35 -v       # Run with GStreamer debug output")
+			return
+		}
 		// Run SCTE-35 handler mode
-		runSCTE35Example()
+		runSCTE35Example(verbose)
 		return
 	}
 	// Create a new stream scheduler with output to localhost:5000
@@ -99,4 +119,55 @@ func main() {
 	// Stop the scheduler
 	streamScheduler.Stop()
 	fmt.Println("Scheduler stopped.")
+}
+
+func runSCTE35Example(verbose bool) {
+	fmt.Println("Starting SCTE-35 Handler Example...")
+	if verbose {
+		fmt.Println("Verbose logging enabled")
+	}
+
+	// Create handler with example parameters
+	handler, err := NewAdInsertionHandler(
+		"239.1.1.1", // input host
+		5002,        // input port
+		"239.1.1.5", // output host
+		5006,        // output port
+		"/home/fstar/work/video-scheduler-gstreamer/videos/input.mp4", // ad source file
+		verbose, // verbose flag
+	)
+	if err != nil {
+		fmt.Printf("Failed to create handler: %v\n", err)
+		return
+	}
+
+	// Set ad duration
+	handler.SetAdDuration(10 * time.Second)
+
+	// Start the handler
+	err = handler.Start()
+	if err != nil {
+		fmt.Printf("Failed to start handler: %v\n", err)
+		return
+	}
+
+	fmt.Println("SCTE-35 Handler started successfully!")
+	fmt.Println("Waiting for SCTE-35 messages...")
+
+	// Set up signal handling for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// Simulate SCTE-35 detection after 5 seconds
+	go func() {
+		time.Sleep(5 * time.Second)
+		fmt.Println("Simulating SCTE-35 message detection...")
+		handler.insertAd()
+	}()
+
+	// Wait for shutdown signal
+	<-sigChan
+	fmt.Println("\nShutting down SCTE-35 Handler...")
+	handler.Stop()
+	fmt.Println("SCTE-35 Handler stopped.")
 }
