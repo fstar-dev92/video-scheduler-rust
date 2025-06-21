@@ -83,6 +83,9 @@ func (h *AdInsertionHandler) Start() error {
 	// Start the main pipeline
 	h.mainPipeline.SetState(gst.StatePlaying)
 
+	// Wait a moment for dynamic pads to be created
+	time.Sleep(1 * time.Second)
+
 	// Start monitoring goroutine
 	go h.monitorPipelines()
 
@@ -108,13 +111,42 @@ func (h *AdInsertionHandler) createMainPipeline() error {
 		return fmt.Errorf("failed to create udpsrc: %v", err)
 	}
 
-	// Create RTP depayloader
-	rtpdepay, err := gst.NewElement("rtpmp2tdepay")
+	// Create RTP stream depayloader for handling multiple media types
+	rtpstreamdepay, err := gst.NewElementWithProperties("rtpstreamdepay", map[string]interface{}{
+		"name": "rtpstreamdepay" + h.handlerID,
+	})
 	if err != nil {
-		return fmt.Errorf("failed to create rtpmp2tdepay: %v", err)
+		return fmt.Errorf("failed to create rtpstreamdepay: %v", err)
 	}
 
-	// Create demuxer for main stream processing with SCTE-35 event forwarding
+	// Create RTP caps for the stream
+	rtpStreamCaps := gst.NewCapsFromString("application/x-rtp-stream")
+	rtpCapsFilter, err := gst.NewElementWithProperties("capsfilter", map[string]interface{}{
+		"caps": rtpStreamCaps,
+		"name": "rtpStreamCapsFilter" + h.handlerID,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create rtpStreamCapsFilter: %v", err)
+	}
+
+	// Create RTP depayloaders for video and audio
+	rtph264depay, err := gst.NewElement("rtph264depay")
+	if err != nil {
+		return fmt.Errorf("failed to create rtph264depay: %v", err)
+	}
+
+	rtpL16depay, err := gst.NewElement("rtpL16depay")
+	if err != nil {
+		return fmt.Errorf("failed to create rtpL16depay: %v", err)
+	}
+
+	// Create parsers
+	h264parse, err := gst.NewElement("h264parse")
+	if err != nil {
+		return fmt.Errorf("failed to create h264parse: %v", err)
+	}
+
+	// Create demuxer for main stream processing
 	demux, err := gst.NewElementWithProperties("tsdemux", map[string]interface{}{
 		"name": "tsdemux" + h.handlerID,
 	})
@@ -384,17 +416,8 @@ func (h *AdInsertionHandler) createMainPipeline() error {
 	}
 
 	// Add all elements to the pipeline
-	rtpCaps := gst.NewCapsFromString("application/x-rtp, media=video, clock-rate=90000, encoding-name=MP2T, payload=33")
-	capsfilter, err := gst.NewElementWithProperties("capsfilter", map[string]interface{}{
-		"caps": rtpCaps,
-		"name": "rtpCapsFilter" + h.handlerID,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to create capsfilter: %v", err)
-	}
-	pipeline.Add(capsfilter)
-	udpsrc.Link(capsfilter)
-	capsfilter.Link(rtpdepay)
+	pipeline.AddMany(udpsrc, rtpCapsFilter, rtpstreamdepay)
+	pipeline.AddMany(rtph264depay, rtpL16depay, h264parse)
 	pipeline.AddMany(demux)
 	pipeline.AddMany(intervideo1, intervideo2, h.compositor, videoconv, h264enc)
 	pipeline.AddMany(interaudio1, interaudio2, h.audiomixer, audioconv, aacenc)
@@ -426,14 +449,69 @@ func (h *AdInsertionHandler) createMainPipeline() error {
 	pipeline.AddMany(intervideosink1, interaudiosink1)
 
 	// Link elements
-	rtpdepay.Link(demux)
+	udpsrc.Link(rtpCapsFilter)
+	rtpCapsFilter.Link(rtpstreamdepay)
+
+	// Set up dynamic pad-added signal for rtpstreamdepay
+	rtpstreamdepay.Connect("pad-added", func(element *gst.Element, pad *gst.Pad) {
+		padName := pad.GetName()
+		fmt.Printf("RTP stream pad added: %s\n", padName)
+
+		// Check if this is a video or audio RTP stream
+		if padName == "recv_rtp_src_0" || padName == "recv_rtp_src_1" {
+			// Determine if this is video or audio based on pad name or caps
+			isVideo := padName == "recv_rtp_src_0"
+			mediaType := "audio"
+			if isVideo {
+				mediaType = "video"
+			}
+
+			fmt.Printf("Processing %s RTP stream from pad: %s\n", mediaType, padName)
+
+			// Create appropriate RTP caps
+			rtpCapsStr := fmt.Sprintf("application/x-rtp,media=%s", mediaType)
+			rtpCaps := gst.NewCapsFromString(rtpCapsStr)
+			capsFilter, err := gst.NewElementWithProperties("capsfilter", map[string]interface{}{
+				"caps": rtpCaps,
+				"name": fmt.Sprintf("%sRtpCapsFilter%s", mediaType, h.handlerID),
+			})
+			if err != nil {
+				fmt.Printf("Failed to create %s RTP caps filter: %v\n", mediaType, err)
+				return
+			}
+			pipeline.Add(capsFilter)
+
+			// Link the pad to the caps filter
+			result := pad.Link(capsFilter.GetStaticPad("sink"))
+			if result != gst.PadLinkOK {
+				fmt.Printf("Failed to link %s pad to caps filter: %v\n", mediaType, result)
+				return
+			}
+
+			if isVideo {
+				// Link video path: capsFilter -> rtph264depay -> h264parse -> demux
+				capsFilter.Link(rtph264depay)
+				rtph264depay.Link(h264parse)
+				h264parse.Link(demux)
+				fmt.Printf("Successfully linked video RTP stream to demuxer\n")
+			} else {
+				// Link audio path: capsFilter -> rtpL16depay -> demux
+				capsFilter.Link(rtpL16depay)
+				rtpL16depay.Link(demux)
+				fmt.Printf("Successfully linked audio RTP stream to demuxer\n")
+			}
+		} else {
+			fmt.Printf("Unknown RTP stream pad: %s\n", padName)
+		}
+	})
 
 	// Set up dynamic pad-added signal for demuxer
 	demux.Connect("pad-added", func(element *gst.Element, pad *gst.Pad) {
 		padName := pad.GetName()
-		fmt.Printf("Dynamic pad added: %s\n", padName)
+		fmt.Printf("Demuxer pad added: %s\n", padName)
 
 		if padName == "video_0" {
+			fmt.Printf("Linking video pad to intervideosink1\n")
 			// Link video pad to existing intervideosink
 			result := pad.Link(intervideosink1.GetStaticPad("sink"))
 			if result != gst.PadLinkOK {
@@ -442,6 +520,7 @@ func (h *AdInsertionHandler) createMainPipeline() error {
 				fmt.Printf("Successfully linked video pad to intervideosink\n")
 			}
 		} else if padName == "audio_0" {
+			fmt.Printf("Linking audio pad to interaudiosink1\n")
 			// Link audio pad to existing interaudiosink
 			result := pad.Link(interaudiosink1.GetStaticPad("sink"))
 			if result != gst.PadLinkOK {
@@ -449,9 +528,11 @@ func (h *AdInsertionHandler) createMainPipeline() error {
 			} else {
 				fmt.Printf("Successfully linked audio pad to interaudiosink\n")
 			}
+		} else {
+			fmt.Printf("Unknown demuxer pad: %s\n", padName)
 		}
 	})
-
+	intervideosink1.Link(intervideo1)
 	// Link video elements
 	intervideo1.Link(videoQueue1)
 	videoQueue1.Link(h.compositor)
@@ -463,16 +544,17 @@ func (h *AdInsertionHandler) createMainPipeline() error {
 	h264enc.Link(muxerQueue)
 
 	// Link audio elements
+	interaudiosink1.Link(interaudio1)
 	interaudio1.Link(audioQueue1)
 	audioQueue1.Link(audioconv1)
-	audioconv1.Link(audioresample1)
-	audioresample1.Link(audiocaps1)
+	audioQueue1.Link(audioresample1)
+	audioQueue1.Link(audiocaps1)
 	audiocaps1.Link(h.audiomixer)
 
 	interaudio2.Link(audioQueue2)
 	audioQueue2.Link(audioconv2)
-	audioconv2.Link(audioresample2)
-	audioresample2.Link(audiocaps2)
+	audioQueue2.Link(audioresample2)
+	audioQueue2.Link(audiocaps2)
 	audiocaps2.Link(h.audiomixer)
 
 	h.audiomixer.Link(audioMixerQueue)
