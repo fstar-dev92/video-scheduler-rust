@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/binary"
 	"fmt"
 	"sync"
 	"time"
@@ -510,7 +509,7 @@ func (h *AdInsertionHandler) createMainPipeline() error {
 		padName := pad.GetName()
 		fmt.Printf("Demuxer pad added: %s\n", padName)
 
-		if padName == "video_0" {
+		if len(padName) >= 5 && padName[:5] == "video" {
 			fmt.Printf("Linking video pad to intervideosink1\n")
 			// Link video pad to existing intervideosink
 			result := pad.Link(intervideosink1.GetStaticPad("sink"))
@@ -519,7 +518,7 @@ func (h *AdInsertionHandler) createMainPipeline() error {
 			} else {
 				fmt.Printf("Successfully linked video pad to intervideosink\n")
 			}
-		} else if padName == "audio_0" {
+		} else if len(padName) >= 5 && padName[:5] == "audio" {
 			fmt.Printf("Linking audio pad to interaudiosink1\n")
 			// Link audio pad to existing interaudiosink
 			result := pad.Link(interaudiosink1.GetStaticPad("sink"))
@@ -532,11 +531,33 @@ func (h *AdInsertionHandler) createMainPipeline() error {
 			fmt.Printf("Unknown demuxer pad: %s\n", padName)
 		}
 	})
-	intervideosink1.Link(intervideo1)
 	// Link video elements
-	intervideo1.Link(videoQueue1)
+	intervideo1.Connect("pad-added", func(element *gst.Element, pad *gst.Pad) {
+		fmt.Println("intervideosrc1 pad added:", pad.GetName())
+		if pad.GetName() == "src" {
+			ok := pad.Link(videoQueue1.GetStaticPad("sink"))
+			if ok != gst.PadLinkOK {
+				fmt.Printf("Failed to link intervideo1 to videoQueue1: %v\n", ok)
+			} else {
+				fmt.Println("Successfully linked intervideo1 -> videoQueue1")
+
+			}
+		}
+	})
+
+	intervideo2.Connect("pad-added", func(element *gst.Element, pad *gst.Pad) {
+		fmt.Println("intervideosrc2 pad added:", pad.GetName())
+		if pad.GetName() == "src" {
+			ok := pad.Link(videoQueue2.GetStaticPad("sink"))
+			if ok != gst.PadLinkOK {
+				fmt.Printf("Failed to link intervideo1 to videoQueue2: %v\n", ok)
+			} else {
+				fmt.Println("Successfully linked intervideo1 -> videoQueue2")
+			}
+		}
+	})
+
 	videoQueue1.Link(h.compositor)
-	intervideo2.Link(videoQueue2)
 	videoQueue2.Link(h.compositor)
 	h.compositor.Link(videoMixerQueue)
 	videoMixerQueue.Link(videoconv)
@@ -544,17 +565,16 @@ func (h *AdInsertionHandler) createMainPipeline() error {
 	h264enc.Link(muxerQueue)
 
 	// Link audio elements
-	interaudiosink1.Link(interaudio1)
 	interaudio1.Link(audioQueue1)
 	audioQueue1.Link(audioconv1)
-	audioQueue1.Link(audioresample1)
-	audioQueue1.Link(audiocaps1)
+	audioconv1.Link(audioresample1)
+	audioresample1.Link(audiocaps1)
 	audiocaps1.Link(h.audiomixer)
 
 	interaudio2.Link(audioQueue2)
 	audioQueue2.Link(audioconv2)
-	audioQueue2.Link(audioresample2)
-	audioQueue2.Link(audiocaps2)
+	audioconv2.Link(audioresample2)
+	audioresample2.Link(audiocaps2)
 	audiocaps2.Link(h.audiomixer)
 
 	h.audiomixer.Link(audioMixerQueue)
@@ -580,13 +600,6 @@ func (h *AdInsertionHandler) createMainPipeline() error {
 				gerr := msg.ParseError()
 				elementName := msg.Source()
 				fmt.Printf("Error from element %s: %s\n", elementName, gerr.Error())
-
-				// Handle specific inter element errors
-				if elementName == "intervideosrc1"+h.handlerID || elementName == "intervideosrc2"+h.handlerID {
-					fmt.Printf("Video inter source error - this may be normal during startup\n")
-				} else if elementName == "interaudiosrc1"+h.handlerID || elementName == "interaudiosrc2"+h.handlerID {
-					fmt.Printf("Audio inter source error - this may be normal during startup\n")
-				}
 
 			case gst.MessageWarning:
 				gerr := msg.ParseWarning()
@@ -684,95 +697,6 @@ func (h *AdInsertionHandler) createAdPipeline() error {
 	}()
 
 	h.adPipeline = pipeline
-	return nil
-}
-
-// handleSCTE35Event handles SCTE-35 events detected from the stream
-func (h *AdInsertionHandler) handleSCTE35Event(event *gst.Event) {
-	fmt.Printf("Handling SCTE-35 event\n")
-
-	// For now, we'll trigger ad insertion on any event
-	// In a real implementation, you would parse the event data to extract SCTE-35 information
-	fmt.Printf("SCTE-35 event detected - inserting ad\n")
-	h.insertAd()
-}
-
-// handleSCTE35EventWithPTS handles SCTE-35 events with PTS timing information
-func (h *AdInsertionHandler) handleSCTE35EventWithPTS(data []byte, pts uint64, duration uint64) {
-
-	// Parse SCTE-35 message
-	message := h.parseSCTE35Message(data)
-	if message == nil {
-		fmt.Println("Failed to parse SCTE-35 message")
-		return
-	}
-
-	fmt.Printf("SCTE-35 Command Type: %d\n", message.SpliceCommandType)
-
-	switch message.SpliceCommandType {
-	case 0x05: // Splice Insert
-		fmt.Printf("Splice Insert command detected - scheduling ad insertion\n")
-		h.scheduleAdInsertion(message.PTSAdjustment, message)
-	case 0x06: // Splice Null
-		fmt.Printf("Splice Null command detected\n")
-	case 0x07: // Splice Schedule
-		fmt.Printf("Splice Schedule command detected - scheduling ad insertion\n")
-		h.scheduleAdInsertion(message.PTSAdjustment, message)
-	default:
-		fmt.Printf("Unknown SCTE-35 command type: %d\n", message.SpliceCommandType)
-	}
-}
-
-// scheduleAdInsertion schedules ad insertion at the correct PTS time
-func (h *AdInsertionHandler) scheduleAdInsertion(pts uint64, message *SCTE35Message) {
-	// Get current PTS from pipeline
-	currentPTS := h.getCurrentPTS()
-
-	// Convert PTS to time.Duration (PTS is in 90kHz clock units)
-	ptsDuration := h.convertPTSToDuration(pts)
-
-	// Calculate when to insert the ad based on PTS adjustment
-	// PTS adjustment is the offset from the current PTS to when the splice should occur
-	ptsAdjustmentDuration := h.convertPTSToDuration(message.PTSAdjustment)
-	insertTime := ptsDuration + ptsAdjustmentDuration
-
-	fmt.Printf("Scheduling ad insertion - Current PTS: %v, Event PTS: %v, PTS Adjustment: %v, Insert Time: %v\n",
-		currentPTS, pts, message.PTSAdjustment, insertTime)
-
-	// Schedule the ad insertion
-	time.AfterFunc(insertTime, func() {
-		h.insertAd()
-	})
-}
-
-// parseSCTE35Message parses a SCTE-35 message from raw data
-func (h *AdInsertionHandler) parseSCTE35Message(data []byte) *SCTE35Message {
-	if len(data) < 8 {
-		return nil
-	}
-
-	// Basic SCTE-35 parsing
-	message := &SCTE35Message{
-		TableID:                data[0],
-		SectionSyntaxIndicator: (data[1] & 0x80) != 0,
-		PrivateIndicator:       (data[1] & 0x40) != 0,
-		SectionLength:          binary.BigEndian.Uint16(data[1:3]) & 0x0FFF,
-	}
-
-	// Check if this is a SCTE-35 splice insert command
-	if len(data) >= 19 && data[0] == 0xFC { // SCTE-35 table ID
-		message.ProtocolVersion = data[3]
-		message.EncryptedPacket = (data[4] & 0x80) != 0
-		message.EncryptionAlgorithm = data[4] & 0x3F
-		message.PTSAdjustment = binary.BigEndian.Uint64(append([]byte{0}, data[5:13]...))
-		message.CWIndex = data[13]
-		message.Tier = binary.BigEndian.Uint16(data[14:16])
-		message.SpliceCommandLength = binary.BigEndian.Uint16(data[16:18])
-		message.SpliceCommandType = data[18]
-
-		return message
-	}
-
 	return nil
 }
 
