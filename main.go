@@ -42,6 +42,27 @@ func main() {
 		runSCTE35Example(verbose)
 		return
 	}
+
+	if len(os.Args) > 1 && os.Args[1] == "pipeline" {
+		// Check for help flag
+		if len(os.Args) > 2 && (os.Args[2] == "-h" || os.Args[2] == "--help") {
+			fmt.Println("GStreamer Pipeline Usage:")
+			fmt.Println("  go run . pipeline [-v]")
+			fmt.Println("")
+			fmt.Println("Options:")
+			fmt.Println("  -v    Enable verbose logging")
+			fmt.Println("  -h    Show this help message")
+			fmt.Println("")
+			fmt.Println("Examples:")
+			fmt.Println("  go run . pipeline        # Run with normal logging")
+			fmt.Println("  go run . pipeline -v     # Run with verbose logging")
+			return
+		}
+		// Run GStreamer pipeline mode
+		runGStreamerPipeline(verbose)
+		return
+	}
+
 	// Create a new stream scheduler with output to localhost:5000
 	streamScheduler, err := scheduler.NewStreamScheduler("239.1.1.5", 5000)
 	if err != nil {
@@ -133,7 +154,7 @@ func runSCTE35Example(verbose bool) {
 		5002,        // input port
 		"239.1.1.5", // output host
 		5006,        // output port
-		"/home/fstar/work/video-scheduler-gstreamer/videos/input.mp4", // ad source file
+		"/home/fstar/work/video-scheduler-gstreamer/videos/input2.mp4", // ad source file
 		verbose, // verbose flag
 	)
 	if err != nil {
@@ -170,4 +191,40 @@ func runSCTE35Example(verbose bool) {
 	fmt.Println("\nShutting down SCTE-35 Handler...")
 	handler.Stop()
 	fmt.Println("SCTE-35 Handler stopped.")
+}
+
+func runGStreamerPipeline(verbose bool) {
+	fmt.Println("Starting GStreamer Pipeline Example...")
+	if verbose {
+		fmt.Println("Verbose logging enabled")
+	}
+
+	// Set GStreamer debug level if verbose mode is enabled
+	if verbose {
+		os.Setenv("GST_DEBUG", "3") // 3 = GST_LEVEL_DEBUG
+		fmt.Println("GStreamer debug logging enabled")
+	} else {
+		os.Setenv("GST_DEBUG", "1") // 1 = GST_LEVEL_WARNING
+	}
+
+	// Run the GStreamer pipeline with the parameters from the command
+	// Input: 239.1.1.1:5002, Output: 239.2.2.2:6000
+	err := RunGStreamerPipeline("239.1.1.1", 5002, "239.2.2.2", 6000)
+	if err != nil {
+		fmt.Printf("Failed to run GStreamer pipeline: %v\n", err)
+		return
+	}
+
+	fmt.Println("GStreamer Pipeline started successfully!")
+	fmt.Println("Processing RTP stream from 239.1.1.1:5002 to 239.2.2.2:6000")
+	fmt.Println("Press Ctrl+C to stop...")
+
+	// Set up signal handling for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// Wait for shutdown signal
+	<-sigChan
+	fmt.Println("\nShutting down GStreamer Pipeline...")
+	fmt.Println("GStreamer Pipeline stopped.")
 }

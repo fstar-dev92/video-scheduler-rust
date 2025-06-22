@@ -129,8 +129,8 @@ func (h *AdInsertionHandler) Start() error {
 			}
 			switch msg.Type() {
 			case gst.MessageStateChanged:
-				oldState, newState := msg.ParseStateChanged()
-				if newState == gst.StatePlaying && oldState != gst.StatePaused {
+				_, newState := msg.ParseStateChanged()
+				if newState == gst.StatePlaying {
 					h.logVerbose("Main pipeline is now PLAYING and ready\n")
 					select {
 					case mainPipelineReady <- true:
@@ -518,8 +518,9 @@ func (h *AdInsertionHandler) createMainPipeline() error {
 
 	// Set up dynamic pad-added signal for demuxer
 	demux.Connect("pad-added", func(element *gst.Element, pad *gst.Pad) {
+
 		padName := pad.GetName()
-		h.logVerbose("Demuxer pad added: %s\n", padName)
+		h.logVerbose("##########################################Demuxer pad added: %s\n", padName)
 
 		if len(padName) >= 5 && padName[:5] == "video" {
 			h.logVerbose("Linking video pad to intervideosink1\n")
