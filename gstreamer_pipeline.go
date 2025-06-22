@@ -47,6 +47,9 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	if err != nil {
 		return nil, fmt.Errorf("failed to create video queue: %v", err)
 	}
+	videoQueue.SetProperty("max-size-buffers", 100)
+	videoQueue.SetProperty("max-size-time", uint64(500*1000000))     // 500ms
+	videoQueue.SetProperty("min-threshold-time", uint64(50*1000000)) // 50ms
 
 	h264parse1, err := gst.NewElement("h264parse")
 	if err != nil {
@@ -78,6 +81,9 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	if err != nil {
 		return nil, fmt.Errorf("failed to create audio queue: %v", err)
 	}
+	audioQueue.SetProperty("max-size-buffers", 100)
+	audioQueue.SetProperty("max-size-time", uint64(500*1000000))     // 500ms
+	audioQueue.SetProperty("min-threshold-time", uint64(50*1000000)) // 50ms
 
 	aacparse1, err := gst.NewElement("aacparse")
 	if err != nil {
@@ -104,18 +110,41 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 		return nil, fmt.Errorf("failed to create aacparse2: %v", err)
 	}
 
+	// Final queue before muxer for timing
+	muxerQueue, err := gst.NewElement("queue")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create muxer queue: %v", err)
+	}
+	muxerQueue.SetProperty("max-size-buffers", 200)
+	muxerQueue.SetProperty("max-size-time", uint64(1*1000000000))     // 1 second
+	muxerQueue.SetProperty("min-threshold-time", uint64(100*1000000)) // 100ms
+
 	// Muxer and output elements
 	mpegtsmux, err := gst.NewElement("mpegtsmux")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create mpegtsmux: %v", err)
 	}
 
+	// Configure MPEG-TS muxer for better compatibility
+	mpegtsmux.SetProperty("alignment", 7)
+	mpegtsmux.SetProperty("pat-interval", int64(100*1000000)) // 100ms
+	mpegtsmux.SetProperty("pmt-interval", int64(100*1000000)) // 100ms
+	mpegtsmux.SetProperty("pcr-interval", int64(20*1000000))  // 20ms
+	mpegtsmux.SetProperty("muxrate", 10080000)                // 10.08 Mbps
+
 	rtpmp2tpay, err := gst.NewElement("rtpmp2tpay")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create rtpmp2tpay: %v", err)
 	}
 
-	udpsink, err := gst.NewElement("udpsink")
+	udpsink, err := gst.NewElementWithProperties("udpsink", map[string]interface{}{
+		"host":           outputHost,
+		"port":           outputPort,
+		"sync":           true,
+		"buffer-size":    524288,
+		"auto-multicast": true,
+		"name":           "udpsink",
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create udpsink: %v", err)
 	}
@@ -131,17 +160,14 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 
 	rtpmp2tpay.SetProperty("mtu", 1400)
 	rtpmp2tpay.SetProperty("pt", 33)
-
-	udpsink.SetProperty("host", outputHost)
-	udpsink.SetProperty("port", outputPort)
-	udpsink.SetProperty("auto-multicast", true)
+	rtpmp2tpay.SetProperty("perfect-rtptime", true)
 
 	// Add elements to pipeline
 	elements := []*gst.Element{
 		udpsrc, rtpjitterbuffer, rtpmp2tdepay, tsdemux,
 		videoQueue, h264parse1, avdecH264, videoconvert, x264enc, h264parse2,
 		audioQueue, aacparse1, avdecAac, audioconvert, voaacenc, aacparse2,
-		mpegtsmux, rtpmp2tpay, udpsink,
+		muxerQueue, mpegtsmux, rtpmp2tpay, udpsink,
 	}
 
 	for _, element := range elements {
@@ -209,8 +235,8 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 		return nil, fmt.Errorf("failed to link voaacenc to aacparse2: %v", err)
 	}
 
-	if err := aacparse2.Link(mpegtsmux); err != nil {
-		return nil, fmt.Errorf("failed to link aacparse2 to mpegtsmux: %v", err)
+	if err := aacparse2.Link(muxerQueue); err != nil {
+		return nil, fmt.Errorf("failed to link aacparse2 to muxerQueue: %v", err)
 	}
 
 	// Link output branch
