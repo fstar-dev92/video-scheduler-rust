@@ -7,224 +7,47 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/go-gst/go-gst/gst"
-
-	"scheduler-rtp/scheduler"
 )
 
 func main() {
-	// Parse command line flags
-	var verbose bool
-	flag.BoolVar(&verbose, "v", false, "Enable verbose logging")
-	flag.Parse()
-
 	// Initialize GStreamer
 	gst.Init(nil)
 
-	if len(os.Args) > 1 && os.Args[1] == "scte35" {
-		// Check for help flag
-		if len(os.Args) > 2 && (os.Args[2] == "-h" || os.Args[2] == "--help") {
-			fmt.Println("SCTE-35 Handler Usage:")
-			fmt.Println("  go run . scte35 [-v]")
-			fmt.Println("")
-			fmt.Println("Options:")
-			fmt.Println("  -v    Enable verbose logging and GStreamer debug output (like gst-launch-1.0 -v)")
-			fmt.Println("  -h    Show this help message")
-			fmt.Println("")
-			fmt.Println("Examples:")
-			fmt.Println("  go run . scte35          # Run with normal logging")
-			fmt.Println("  go run . scte35 -v       # Run with GStreamer debug output")
-			return
-		}
-		// Run SCTE-35 handler mode
-		runSCTE35Example(verbose)
-		return
+	// Define command line flags
+	inputHost := flag.String("input-host", "239.1.1.1", "Input RTP stream host")
+	inputPort := flag.Int("input-port", 5000, "Input RTP stream port")
+	outputHost := flag.String("output-host", "239.2.2.2", "Output RTP stream host")
+	outputPort := flag.Int("output-port", 6000, "Output RTP stream port")
+	assetPath := flag.String("asset", "/home/fstar/work/video-scheduler-gstreamer/videos/input.mp4", "Path to local asset video file")
+
+	flag.Parse()
+
+	// Validate asset file exists
+	if _, err := os.Stat(*assetPath); os.IsNotExist(err) {
+		log.Fatalf("Asset file does not exist: %s", *assetPath)
 	}
 
-	if len(os.Args) > 1 && os.Args[1] == "pipeline" {
-		// Check for help flag
-		if len(os.Args) > 2 && (os.Args[2] == "-h" || os.Args[2] == "--help") {
-			fmt.Println("GStreamer Pipeline Usage:")
-			fmt.Println("  go run . pipeline [-v]")
-			fmt.Println("")
-			fmt.Println("Options:")
-			fmt.Println("  -v    Enable verbose logging")
-			fmt.Println("  -h    Show this help message")
-			fmt.Println("")
-			fmt.Println("Examples:")
-			fmt.Println("  go run . pipeline        # Run with normal logging")
-			fmt.Println("  go run . pipeline -v     # Run with verbose logging")
-			return
-		}
-		// Run GStreamer pipeline mode
-		runGStreamerPipeline(verbose)
-		return
-	}
+	fmt.Printf("Starting GStreamer Pipeline with Compositor and Audio Mixer\n")
+	fmt.Printf("Input: %s:%d\n", *inputHost, *inputPort)
+	fmt.Printf("Output: %s:%d\n", *outputHost, *outputPort)
+	fmt.Printf("Asset: %s\n", *assetPath)
+	fmt.Printf("Pipeline will switch to asset after 1 minute\n")
 
-	// Create a new stream scheduler with output to localhost:5000
-	streamScheduler, err := scheduler.NewStreamScheduler("239.1.1.5", 5000)
-	if err != nil {
-		log.Fatalf("Failed to create scheduler: %v", err)
-	}
-
-	// Get current time to schedule items relative to now
-	now := time.Now()
-
-	// Add test file items
-	// We'll schedule a test pattern for 10 seconds, then a file for 10 seconds, then back to test pattern
-	streamScheduler.AddItem(scheduler.StreamItem{
-		Type:     "file",
-		Source:   "/home/ubuntu/Dev/video-scheduler-gstreamer/videos/output.mp4", // First video file
-		Start:    now,
-		Duration: 30 * time.Second,
-	})
-
-	streamScheduler.AddItem(scheduler.StreamItem{
-		Type:     "file",
-		Source:   "/home/ubuntu/Dev/video-scheduler-gstreamer/videos/output2.mp4", // Second video file
-		Start:    now.Add(10 * time.Second),
-		Duration: 60 * time.Second,
-	})
-
-	// Start the scheduler
-	if err := streamScheduler.RunSchedule(); err != nil {
-		log.Fatalf("Failed to start scheduler: %v", err)
-	}
-
-	// Direct UDP URL for VLC
-	fmt.Printf("To play in VLC: Open VLC and go to Media > Open Network Stream > enter udp://@%s:%d\n",
-		"239.1.1.5", 5000)
-
-	fmt.Println("Scheduler1 started. Press Ctrl+C to exit.")
-
-	// Create a new stream scheduler with output to localhost:5000
-	streamScheduler1, err := scheduler.NewStreamScheduler("239.1.1.8", 5001)
-	if err != nil {
-		log.Fatalf("Failed to create scheduler1: %v", err)
-	}
-
-	// Add test file items
-	// We'll schedule a test pattern for 10 seconds, then a file for 10 seconds, then back to test pattern
-	streamScheduler1.AddItem(scheduler.StreamItem{
-		Type:     "file",
-		Source:   "/home/ubuntu/Dev/video-scheduler-gstreamer/videos/output3.mp4", // First video file
-		Start:    now,
-		Duration: 30 * time.Second,
-	})
-
-	streamScheduler1.AddItem(scheduler.StreamItem{
-		Type:     "file",
-		Source:   "/home/ubuntu/Dev/video-scheduler-gstreamer/videos/New_Filler.mp4", // Second video file
-		Start:    now.Add(10 * time.Second),
-		Duration: 60 * time.Second,
-	})
-
-	// Start the scheduler
-	if err := streamScheduler1.RunSchedule(); err != nil {
-		log.Fatalf("Failed to start scheduler1: %v", err)
-	}
-
-	// Direct UDP URL for VLC
-	fmt.Printf("To play in VLC: Open VLC and go to Media > Open Network Stream > enter udp://@%s:%d\n",
-		"239.1.1.8", 5001)
-
-	fmt.Println("Scheduler started. Press Ctrl+C to exit.")
-
-	// Wait for interrupt signal
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	<-sigChan
-
-	// Stop the scheduler
-	streamScheduler.Stop()
-	fmt.Println("Scheduler stopped.")
-}
-
-func runSCTE35Example(verbose bool) {
-	fmt.Println("Starting SCTE-35 Handler Example...")
-	if verbose {
-		fmt.Println("Verbose logging enabled")
-	}
-
-	// Create handler with example parameters
-	handler, err := NewAdInsertionHandler(
-		"239.1.1.1", // input host
-		5002,        // input port
-		"239.1.1.5", // output host
-		5006,        // output port
-		"/home/fstar/work/video-scheduler-gstreamer/videos/input2.mp4", // ad source file
-		verbose, // verbose flag
-	)
-	if err != nil {
-		fmt.Printf("Failed to create handler: %v\n", err)
-		return
-	}
-
-	// Set ad duration
-	handler.SetAdDuration(10 * time.Second)
-
-	// Start the handler
-	err = handler.Start()
-	if err != nil {
-		fmt.Printf("Failed to start handler: %v\n", err)
-		return
-	}
-
-	fmt.Println("SCTE-35 Handler started successfully!")
-	fmt.Println("Waiting for SCTE-35 messages...")
-
-	// Set up signal handling for graceful shutdown
+	// Create a channel to handle graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// Simulate SCTE-35 detection after 5 seconds
+	// Start the pipeline in a goroutine
 	go func() {
-		time.Sleep(5 * time.Second)
-		fmt.Println("Simulating SCTE-35 message detection...")
-		handler.insertAd()
+		err := RunGStreamerPipeline(*inputHost, *inputPort, *outputHost, *outputPort, *assetPath)
+		if err != nil {
+			log.Fatalf("Pipeline error: %v", err)
+		}
 	}()
 
 	// Wait for shutdown signal
 	<-sigChan
-	fmt.Println("\nShutting down SCTE-35 Handler...")
-	handler.Stop()
-	fmt.Println("SCTE-35 Handler stopped.")
-}
-
-func runGStreamerPipeline(verbose bool) {
-	fmt.Println("Starting GStreamer Pipeline Example...")
-	if verbose {
-		fmt.Println("Verbose logging enabled")
-	}
-
-	// Set GStreamer debug level if verbose mode is enabled
-	if verbose {
-		os.Setenv("GST_DEBUG", "3") // 3 = GST_LEVEL_DEBUG
-		fmt.Println("GStreamer debug logging enabled")
-	} else {
-		os.Setenv("GST_DEBUG", "1") // 1 = GST_LEVEL_WARNING
-	}
-
-	// Run the GStreamer pipeline with the parameters from the command
-	// Input: 239.1.1.1:5002, Output: 239.2.2.2:6000
-	err := RunGStreamerPipeline("239.1.1.1", 5002, "239.2.2.2", 6000)
-	if err != nil {
-		fmt.Printf("Failed to run GStreamer pipeline: %v\n", err)
-		return
-	}
-
-	fmt.Println("GStreamer Pipeline started successfully!")
-	fmt.Println("Processing RTP stream from 239.1.1.1:5002 to 239.2.2.2:6000")
-	fmt.Println("Press Ctrl+C to stop...")
-
-	// Set up signal handling for graceful shutdown
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	// Wait for shutdown signal
-	<-sigChan
-	fmt.Println("\nShutting down GStreamer Pipeline...")
-	fmt.Println("GStreamer Pipeline stopped.")
+	fmt.Println("\nReceived shutdown signal, stopping pipeline...")
 }
