@@ -164,6 +164,10 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	}
 
 	// Link video branch
+	if err := videoQueue.Link(h264parse1); err != nil {
+		return nil, fmt.Errorf("failed to link videoQueue to h264parse1: %v", err)
+	}
+
 	if err := h264parse1.Link(avdecH264); err != nil {
 		return nil, fmt.Errorf("failed to link h264parse1 to avdec_h264: %v", err)
 	}
@@ -185,6 +189,10 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	}
 
 	// Link audio branch
+	if err := audioQueue.Link(aacparse1); err != nil {
+		return nil, fmt.Errorf("failed to link audioQueue to aacparse1: %v", err)
+	}
+
 	if err := aacparse1.Link(avdecAac); err != nil {
 		return nil, fmt.Errorf("failed to link aacparse1 to avdec_aac: %v", err)
 	}
@@ -218,25 +226,34 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	tsdemux.Connect("pad-added", func(self *gst.Element, pad *gst.Pad) {
 		fmt.Printf("Demuxer pad added: %s\n", pad.GetName())
 
-		// Try to link to video queue first, then audio queue
-		// This is a simplified approach that should work for most cases
-		sinkPad := videoQueue.GetRequestPad("sink")
-		if sinkPad != nil {
-			if pad.Link(sinkPad) == gst.PadLinkOK {
-				fmt.Printf("Successfully linked demuxer pad to video queue\n")
-				return
-			}
+		padName := pad.GetName()
+		var targetElement *gst.Element
+
+		// Check pad name to determine if it's video or audio
+		if len(padName) >= 5 && padName[:5] == "video" {
+			targetElement = videoQueue
+			fmt.Printf("Linking video pad %s to video queue\n", padName)
+		} else if len(padName) >= 5 && padName[:5] == "audio" {
+			targetElement = audioQueue
+			fmt.Printf("Linking audio pad %s to audio queue\n", padName)
+		} else {
+			fmt.Printf("Unknown demuxer pad: %s\n", padName)
+			return
 		}
 
-		sinkPad = audioQueue.GetRequestPad("sink")
-		if sinkPad != nil {
-			if pad.Link(sinkPad) == gst.PadLinkOK {
-				fmt.Printf("Successfully linked demuxer pad to audio queue\n")
-				return
-			}
+		// Get the sink pad from the target element
+		sinkPad := targetElement.GetStaticPad("sink")
+		if sinkPad == nil {
+			fmt.Printf("Failed to get sink pad from target element\n")
+			return
 		}
 
-		fmt.Printf("Failed to link demuxer pad to any queue\n")
+		// Link the demuxer pad to the target element
+		if pad.Link(sinkPad) == gst.PadLinkOK {
+			fmt.Printf("Successfully linked demuxer pad %s to %s\n", padName, targetElement.GetName())
+		} else {
+			fmt.Printf("Failed to link demuxer pad %s to %s\n", padName, targetElement.GetName())
+		}
 	})
 
 	return &GStreamerPipeline{
