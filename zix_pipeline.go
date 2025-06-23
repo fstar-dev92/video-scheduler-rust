@@ -116,13 +116,6 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 		return nil, fmt.Errorf("failed to create udpsrc: %v", err)
 	}
 
-	rtpjitterbuffer, err := gst.NewElementWithProperties("rtpjitterbuffer", map[string]interface{}{
-		"name": fmt.Sprintf("rtpjitterbuffer_%s", pipelineID),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create rtpjitterbuffer: %v", err)
-	}
-
 	rtpmp2tdepay, err := gst.NewElementWithProperties("rtpmp2tdepay", map[string]interface{}{
 		"name": fmt.Sprintf("rtpmp2tdepay_%s", pipelineID),
 	})
@@ -250,7 +243,7 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 		return nil, fmt.Errorf("failed to create video queue 1: %v", err)
 	}
 	videoQueue1.SetProperty("max-size-buffers", 100)
-	videoQueue1.SetProperty("max-size-time", uint64(500*1000000))
+	videoQueue1.SetProperty("max-size-time", uint64(700*1000000)) // 200ms instead of 500ms
 	videoQueue1.SetProperty("min-threshold-time", uint64(50*1000000))
 
 	// Create video processing elements for asset stream (input2)
@@ -261,7 +254,7 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 		return nil, fmt.Errorf("failed to create video queue 2: %v", err)
 	}
 	videoQueue2.SetProperty("max-size-buffers", 100)
-	videoQueue2.SetProperty("max-size-time", uint64(500*1000000))
+	videoQueue2.SetProperty("max-size-time", uint64(700*1000000)) // 200ms instead of 500ms
 	videoQueue2.SetProperty("min-threshold-time", uint64(50*1000000))
 
 	// Create video processing chain elements
@@ -293,8 +286,8 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	if err != nil {
 		return nil, fmt.Errorf("failed to create video muxer queue: %v", err)
 	}
-	videoMuxerQueue.SetProperty("max-size-buffers", 100) // Increase buffer limit
-	videoMuxerQueue.SetProperty("max-size-time", uint64(200*1000000))
+	videoMuxerQueue.SetProperty("max-size-buffers", 500) // Increase buffer limit
+	videoMuxerQueue.SetProperty("max-size-time", uint64(500*1000000))
 	videoMuxerQueue.SetProperty("min-threshold-time", uint64(50*1000000))
 	videoMuxerQueue.SetProperty("sync", false)       // Disable sync for real-time
 	videoMuxerQueue.SetProperty("leaky", 0)          // No leaking
@@ -308,7 +301,7 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 		return nil, fmt.Errorf("failed to create audio queue 1: %v", err)
 	}
 	audioQueue1.SetProperty("max-size-buffers", 100)
-	audioQueue1.SetProperty("max-size-time", uint64(500*1000000))
+	audioQueue1.SetProperty("max-size-time", uint64(700*1000000)) // 200ms instead of 500ms
 	audioQueue1.SetProperty("min-threshold-time", uint64(50*1000000))
 
 	// Create audio processing elements for asset stream (audio2)
@@ -319,7 +312,7 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 		return nil, fmt.Errorf("failed to create audio queue 2: %v", err)
 	}
 	audioQueue2.SetProperty("max-size-buffers", 100)
-	audioQueue2.SetProperty("max-size-time", uint64(500*1000000))
+	audioQueue2.SetProperty("max-size-time", uint64(700*1000000)) // 200ms instead of 500ms
 	audioQueue2.SetProperty("min-threshold-time", uint64(50*1000000))
 
 	// Create audio processing chain elements
@@ -365,8 +358,8 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	if err != nil {
 		return nil, fmt.Errorf("failed to create audio muxer queue: %v", err)
 	}
-	audioMuxerQueue.SetProperty("max-size-buffers", 100) // Increase buffer limit
-	audioMuxerQueue.SetProperty("max-size-time", uint64(200*1000000))
+	audioMuxerQueue.SetProperty("max-size-buffers", 250) // Increase buffer limit
+	audioMuxerQueue.SetProperty("max-size-time", uint64(500*1000000))
 	audioMuxerQueue.SetProperty("min-threshold-time", uint64(50*1000000))
 	audioMuxerQueue.SetProperty("sync", false)       // Disable sync for real-time
 	audioMuxerQueue.SetProperty("leaky", 0)          // No leaking
@@ -400,28 +393,14 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 		return nil, fmt.Errorf("failed to create udpsink: %v", err)
 	}
 
-	// Create clock provider for better synchronization
-	clockProvider, err := gst.NewElementWithProperties("identity", map[string]interface{}{
-		"name": fmt.Sprintf("clockProvider_%s", pipelineID),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create clock provider: %v", err)
-	}
-	clockProvider.SetProperty("sync", false) // Disable sync for real-time
-
 	// Set properties
 	udpsrc.SetProperty("address", inputHost)
 	udpsrc.SetProperty("port", inputPort)
 	udpsrc.SetProperty("caps", gst.NewCapsFromString("application/x-rtp"))
 
-	// Improved RTP jitter buffer configuration for better clock handling
-	rtpjitterbuffer.SetProperty("latency", 300)             // Increased latency for better buffering
-	rtpjitterbuffer.SetProperty("do-lost", true)            // Handle lost packets
-	rtpjitterbuffer.SetProperty("drop-on-latency", true)    // Drop packets if too late
-	rtpjitterbuffer.SetProperty("max-dropout-time", 5000)   // 5 seconds max dropout
-	rtpjitterbuffer.SetProperty("max-misorder-time", 500)   // 500ms max misorder
-	rtpjitterbuffer.SetProperty("do-retransmission", false) // Disable retransmission for live streams
-	rtpjitterbuffer.SetProperty("max-latency", 1000)        // 1 second max latency
+	// Configure pipeline latency for proper synchronization
+	// Use a more conservative latency setting to avoid conflicts
+	pipeline.SetProperty("latency", int64(500*1000000)) // 500ms pipeline latency for live streaming
 
 	x264enc.SetProperty("tune", "zerolatency")
 
@@ -441,7 +420,9 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	mpegtsmux.SetProperty("pat-interval", int64(100*1000000)) // 100ms
 	mpegtsmux.SetProperty("pmt-interval", int64(100*1000000)) // 100ms
 	mpegtsmux.SetProperty("pcr-interval", int64(20*1000000))  // 20ms
-	mpegtsmux.SetProperty("min-upstream-latency", 100000000)  // Set latency to 0 for real-time
+	mpegtsmux.SetProperty("muxrate", 10080000)                // 10.08 Mbps
+	mpegtsmux.SetProperty("sync", false)                      // Disable sync for real-time
+	mpegtsmux.SetProperty("dts-method", 0)                    // Use default DTS method
 
 	rtpmp2tpay.SetProperty("mtu", 1400)
 	rtpmp2tpay.SetProperty("pt", 33)
@@ -449,13 +430,13 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 
 	// Add elements to pipeline
 	elements := []*gst.Element{
-		udpsrc, rtpjitterbuffer, rtpmp2tdepay, tsdemux,
+		udpsrc, rtpmp2tdepay, tsdemux,
 		intervideosink1, interaudiosink1,
 		intervideo1, intervideo2, compositor,
 		interaudio1, interaudio2, audiomixer,
 		videoQueue1, videoQueue2, videoconvert, x264enc, h264parse2, videoMuxerQueue,
 		audioQueue1, audioQueue2, aacparse1, audioconvert, audioresample, voaacenc, aacparse2,
-		audioMuxerQueue, mpegtsmux, rtpmp2tpay, udpsink, clockProvider,
+		audioMuxerQueue, mpegtsmux, rtpmp2tpay, udpsink,
 	}
 
 	for _, element := range elements {
@@ -466,7 +447,7 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 
 	// Link elements (except demuxer which needs dynamic linking)
 	if err := udpsrc.Link(rtpmp2tdepay); err != nil {
-		return nil, fmt.Errorf("failed to link udpsrc to rtpjitterbuffer: %v", err)
+		return nil, fmt.Errorf("failed to link udpsrc to rtpmp2tdepay: %v", err)
 	}
 
 	if err := rtpmp2tdepay.Link(tsdemux); err != nil {
@@ -616,17 +597,6 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 				}
 				videoDecoder.SetProperty("sync", false) // Disable sync for real-time
 
-				// Create capsfilter for video format conversion
-				videoCapsfilter, err := gst.NewElementWithProperties("capsfilter", map[string]interface{}{
-					"name": fmt.Sprintf("videoCapsfilter_%s_%s", pipelineID, padName),
-				})
-				if err != nil {
-					fmt.Printf("[%s] Failed to create video capsfilter: %v\n", pipelineID, err)
-					return
-				}
-				// Use raw video format compatible with intervideosink
-				videoCapsfilter.SetProperty("caps", gst.NewCapsFromString("video/x-raw,format=I420,width=1920,height=1080,framerate=30/1"))
-
 				// Add elements to pipeline
 				if err := gp.pipeline.Add(videoDemuxQueue); err != nil {
 					fmt.Printf("[%s] Failed to add video demux queue to pipeline: %v\n", pipelineID, err)
@@ -638,10 +608,6 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 				}
 				if err := gp.pipeline.Add(videoDecoder); err != nil {
 					fmt.Printf("[%s] Failed to add video decoder to pipeline: %v\n", pipelineID, err)
-					return
-				}
-				if err := gp.pipeline.Add(videoCapsfilter); err != nil {
-					fmt.Printf("[%s] Failed to add video capsfilter to pipeline: %v\n", pipelineID, err)
 					return
 				}
 
@@ -658,34 +624,33 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 					fmt.Printf("[%s] Failed to set video decoder state: %v\n", pipelineID, err)
 					return
 				}
-				if err := videoCapsfilter.SetState(gst.StatePlaying); err != nil {
-					fmt.Printf("[%s] Failed to set video capsfilter state: %v\n", pipelineID, err)
-					return
-				}
 
-				// Link the chain: demux -> queue -> h264parse -> decoder -> capsfilter -> intervideosink
+				// Link the chain: demux -> queue -> h264parse -> decoder -> intervideosink
 				if pad.Link(videoDemuxQueue.GetStaticPad("sink")) != gst.PadLinkOK {
 					fmt.Printf("[%s] Failed to link video pad to queue\n", pipelineID)
 					return
 				}
+				fmt.Printf("[%s] Successfully linked video pad to queue\n", pipelineID)
+
 				if videoDemuxQueue.GetStaticPad("src").Link(videoH264parse.GetStaticPad("sink")) != gst.PadLinkOK {
 					fmt.Printf("[%s] Failed to link queue to h264parse\n", pipelineID)
 					return
 				}
+				fmt.Printf("[%s] Successfully linked queue to h264parse\n", pipelineID)
+
 				if videoH264parse.GetStaticPad("src").Link(videoDecoder.GetStaticPad("sink")) != gst.PadLinkOK {
 					fmt.Printf("[%s] Failed to link h264parse to decoder\n", pipelineID)
 					return
 				}
-				if videoDecoder.GetStaticPad("src").Link(videoCapsfilter.GetStaticPad("sink")) != gst.PadLinkOK {
-					fmt.Printf("[%s] Failed to link decoder to capsfilter\n", pipelineID)
-					return
-				}
-				if videoCapsfilter.GetStaticPad("src").Link(intervideosink1.GetStaticPad("sink")) != gst.PadLinkOK {
-					fmt.Printf("[%s] Failed to link capsfilter to intervideosink\n", pipelineID)
-					return
-				}
+				fmt.Printf("[%s] Successfully linked h264parse to decoder\n", pipelineID)
 
-				fmt.Printf("[%s] Successfully linked video pipeline: demux -> queue -> h264parse -> decoder -> capsfilter -> intervideosink\n", pipelineID)
+				if videoDecoder.GetStaticPad("src").Link(intervideosink1.GetStaticPad("sink")) != gst.PadLinkOK {
+					fmt.Printf("[%s] Failed to link decoder to intervideosink\n", pipelineID)
+					return
+				}
+				fmt.Printf("[%s] Successfully linked decoder to intervideosink\n", pipelineID)
+
+				fmt.Printf("[%s] Successfully linked video pipeline: demux -> queue -> h264parse -> decoder -> intervideosink\n", pipelineID)
 				// Mark RTP as connected if we haven't already
 				if !gp.rtpConnected {
 					gp.rtpConnected = true
@@ -740,6 +705,17 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 				}
 				audioConvert.SetProperty("sync", false) // Disable sync for real-time
 
+				// Create audio capsfilter for format conversion
+				audioCapsfilter, err := gst.NewElementWithProperties("capsfilter", map[string]interface{}{
+					"name": fmt.Sprintf("audioCapsfilter_%s_%s", pipelineID, padName),
+				})
+				if err != nil {
+					fmt.Printf("[%s] Failed to create audio capsfilter: %v\n", pipelineID, err)
+					return
+				}
+				// Use standard audio format compatible with audiomixer
+				audioCapsfilter.SetProperty("caps", gst.NewCapsFromString("audio/x-raw,format=S16LE,rate=48000,channels=2,layout=interleaved"))
+
 				// Add elements to pipeline
 				if err := gp.pipeline.Add(audioDemuxQueue); err != nil {
 					fmt.Printf("[%s] Failed to add audio demux queue to pipeline: %v\n", pipelineID, err)
@@ -755,6 +731,10 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 				}
 				if err := gp.pipeline.Add(audioConvert); err != nil {
 					fmt.Printf("[%s] Failed to add audio convert to pipeline: %v\n", pipelineID, err)
+					return
+				}
+				if err := gp.pipeline.Add(audioCapsfilter); err != nil {
+					fmt.Printf("[%s] Failed to add audio capsfilter to pipeline: %v\n", pipelineID, err)
 					return
 				}
 
@@ -775,30 +755,49 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 					fmt.Printf("[%s] Failed to set audio convert state: %v\n", pipelineID, err)
 					return
 				}
+				if err := audioCapsfilter.SetState(gst.StatePlaying); err != nil {
+					fmt.Printf("[%s] Failed to set audio capsfilter state: %v\n", pipelineID, err)
+					return
+				}
 
-				// Link the chain: demux -> queue -> aacparse -> decoder -> audioconvert -> interaudiosink
+				// Link the chain: demux -> queue -> aacparse -> decoder -> audioconvert -> capsfilter -> interaudiosink
 				if pad.Link(audioDemuxQueue.GetStaticPad("sink")) != gst.PadLinkOK {
 					fmt.Printf("[%s] Failed to link audio pad to queue\n", pipelineID)
 					return
 				}
+				fmt.Printf("[%s] Successfully linked audio pad to queue\n", pipelineID)
+
 				if audioDemuxQueue.GetStaticPad("src").Link(audioAacparse.GetStaticPad("sink")) != gst.PadLinkOK {
 					fmt.Printf("[%s] Failed to link queue to aacparse\n", pipelineID)
 					return
 				}
+				fmt.Printf("[%s] Successfully linked queue to aacparse\n", pipelineID)
+
 				if audioAacparse.GetStaticPad("src").Link(audioDecoder.GetStaticPad("sink")) != gst.PadLinkOK {
 					fmt.Printf("[%s] Failed to link aacparse to decoder\n", pipelineID)
 					return
 				}
+				fmt.Printf("[%s] Successfully linked aacparse to decoder\n", pipelineID)
+
 				if audioDecoder.GetStaticPad("src").Link(audioConvert.GetStaticPad("sink")) != gst.PadLinkOK {
 					fmt.Printf("[%s] Failed to link decoder to audioconvert\n", pipelineID)
 					return
 				}
-				if audioConvert.GetStaticPad("src").Link(interaudiosink1.GetStaticPad("sink")) != gst.PadLinkOK {
-					fmt.Printf("[%s] Failed to link audioconvert to interaudiosink\n", pipelineID)
+				fmt.Printf("[%s] Successfully linked decoder to audioconvert\n", pipelineID)
+
+				if audioConvert.GetStaticPad("src").Link(audioCapsfilter.GetStaticPad("sink")) != gst.PadLinkOK {
+					fmt.Printf("[%s] Failed to link audioconvert to capsfilter\n", pipelineID)
 					return
 				}
+				fmt.Printf("[%s] Successfully linked audioconvert to capsfilter\n", pipelineID)
 
-				fmt.Printf("[%s] Successfully linked audio pipeline: demux -> queue -> aacparse -> decoder -> audioconvert -> interaudiosink\n", pipelineID)
+				if audioCapsfilter.GetStaticPad("src").Link(interaudiosink1.GetStaticPad("sink")) != gst.PadLinkOK {
+					fmt.Printf("[%s] Failed to link capsfilter to interaudiosink\n", pipelineID)
+					return
+				}
+				fmt.Printf("[%s] Successfully linked capsfilter to interaudiosink\n", pipelineID)
+
+				fmt.Printf("[%s] Successfully linked audio pipeline: demux -> queue -> aacparse -> decoder -> audioconvert -> capsfilter -> interaudiosink\n", pipelineID)
 				// Mark RTP as connected if we haven't already
 				if !gp.rtpConnected {
 					gp.rtpConnected = true

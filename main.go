@@ -16,9 +16,9 @@ func main() {
 	gst.Init(nil)
 
 	// Define command line flags
-	inputHost := flag.String("input-host", "239.1.1.1", "Input RTP stream host")
+	inputHost := flag.String("input-host", "239.9.9.9", "Input RTP stream host")
 	inputPort := flag.Int("input-port", 5000, "Input RTP stream port")
-	outputHost := flag.String("output-host", "239.2.2.2", "Output RTP stream host")
+	outputHost := flag.String("output-host", "239.8.8.8", "Output RTP stream host")
 	outputPort := flag.Int("output-port", 6000, "Output RTP stream port")
 	assetPath := flag.String("asset", "/home/fstar/work/video-scheduler-gstreamer/videos/input.mp4", "Path to local asset video file")
 
