@@ -223,7 +223,8 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 		pad1.SetProperty("width", 1920)
 		pad1.SetProperty("height", 1080)
 		pad1.SetProperty("alpha", 1.0) // input1 visible
-		fmt.Printf("[%s] Configured videomixer sink_0 (RTP input) with alpha=1.0\n", pipelineID)
+		pad1.SetProperty("zorder", 0)  // Set z-order for proper layering
+		fmt.Printf("[%s] Configured videomixer sink_0 (RTP input) with alpha=1.0, zorder=0\n", pipelineID)
 	} else {
 		fmt.Printf("[%s] Warning: Could not get videomixer sink_0 pad\n", pipelineID)
 	}
@@ -235,7 +236,8 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 		pad2.SetProperty("width", 1920)
 		pad2.SetProperty("height", 1080)
 		pad2.SetProperty("alpha", 0.0) // input2 hidden
-		fmt.Printf("[%s] Configured videomixer sink_1 (asset input) with alpha=0.0\n", pipelineID)
+		pad2.SetProperty("zorder", 1)  // Set z-order for proper layering
+		fmt.Printf("[%s] Configured videomixer sink_1 (asset input) with alpha=0.0, zorder=1\n", pipelineID)
 	} else {
 		fmt.Printf("[%s] Warning: Could not get videomixer sink_1 pad\n", pipelineID)
 	}
@@ -245,6 +247,41 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	videomixer.SetProperty("zero-size-is-unscaled", true) // Don't scale zero-size inputs
 	videomixer.SetProperty("sink-pad-0::alpha", 1.0)      // Set initial alpha for sink_0
 	videomixer.SetProperty("sink-pad-1::alpha", 0.0)      // Set initial alpha for sink_1
+	videomixer.SetProperty("sink-pad-0::xpos", 0)         // Set initial x position for sink_0
+	videomixer.SetProperty("sink-pad-0::ypos", 0)         // Set initial y position for sink_0
+	videomixer.SetProperty("sink-pad-1::xpos", 0)         // Set initial x position for sink_1
+	videomixer.SetProperty("sink-pad-1::ypos", 0)         // Set initial y position for sink_1
+	videomixer.SetProperty("sink-pad-0::width", 1920)     // Set initial width for sink_0
+	videomixer.SetProperty("sink-pad-0::height", 1080)    // Set initial height for sink_0
+	videomixer.SetProperty("sink-pad-1::width", 1920)     // Set initial width for sink_1
+	videomixer.SetProperty("sink-pad-1::height", 1080)    // Set initial height for sink_1
+
+	// Force videomixer to initialize with proper settings
+	videomixer.SetProperty("sink-pad-0::operator", 0)   // Overlay operator
+	videomixer.SetProperty("sink-pad-1::operator", 0)   // Overlay operator
+	videomixer.SetProperty("sink-pad-0::compositor", 0) // Use compositor mode
+	videomixer.SetProperty("sink-pad-1::compositor", 0) // Use compositor mode
+
+	// Create a dummy video source for pre-warming the videomixer
+	dummyVideoSrc, err := gst.NewElementWithProperties("videotestsrc", map[string]interface{}{
+		"name": fmt.Sprintf("dummyVideoSrc_%s", pipelineID),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create dummy video source: %v", err)
+	}
+	dummyVideoSrc.SetProperty("pattern", 0) // Black pattern
+	dummyVideoSrc.SetProperty("is-live", true)
+	dummyVideoSrc.SetProperty("do-timestamp", true)
+
+	// Create a dummy video sink for the dummy source
+	dummyVideoSink, err := gst.NewElementWithProperties("fakesink", map[string]interface{}{
+		"name": fmt.Sprintf("dummyVideoSink_%s", pipelineID),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create dummy video sink: %v", err)
+	}
+	dummyVideoSink.SetProperty("sync", false)
+	dummyVideoSink.SetProperty("async", false)
 
 	// Create audio mixer
 	audiomixer, err := gst.NewElementWithProperties("audiomixer", map[string]interface{}{
@@ -291,8 +328,18 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	if err != nil {
 		return nil, fmt.Errorf("failed to create videomixer capsfilter: %v", err)
 	}
-	// Set flexible caps for videomixer input
-	videomixerCapsfilter.SetProperty("caps", gst.NewCapsFromString("video/x-raw"))
+	// Set flexible caps for videomixer input with proper dimensions
+	videomixerCapsfilter.SetProperty("caps", gst.NewCapsFromString("video/x-raw,width=1920,height=1080"))
+
+	// Create capsfilter after videomixer for output format
+	videomixerOutputCapsfilter, err := gst.NewElementWithProperties("capsfilter", map[string]interface{}{
+		"name": fmt.Sprintf("videomixerOutputCapsfilter_%s", pipelineID),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create videomixer output capsfilter: %v", err)
+	}
+	// Set output caps for videomixer with proper dimensions
+	videomixerOutputCapsfilter.SetProperty("caps", gst.NewCapsFromString("video/x-raw,width=1920,height=1080"))
 
 	x264enc, err := gst.NewElementWithProperties("x264enc", map[string]interface{}{
 		"name": fmt.Sprintf("x264enc_%s", pipelineID),
@@ -520,10 +567,10 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 		intervideosink1, interaudiosink1,
 		intervideo1, intervideo2, videomixer,
 		interaudio1, interaudio2, audiomixer,
-		videoQueue1, videoQueue2, videoconvert, videomixerCapsfilter, x264enc, h264parse2, videoMuxerQueue,
+		videoQueue1, videoQueue2, videoconvert, videomixerCapsfilter, videomixerOutputCapsfilter, x264enc, h264parse2, videoMuxerQueue,
 		audioQueue1, audioQueue2, aacparse1, audioconvert, audioresample, voaacenc, aacparse2,
 		audioMuxerQueue, mpegtsmux, rtpmp2tpay,
-		rtpbin, udpsink,
+		rtpbin, udpsink, dummyVideoSrc, dummyVideoSink,
 	}
 
 	for _, element := range elements {
@@ -673,7 +720,7 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 
 			// Check pad name to determine if it's video or audio
 			if len(padName) >= 5 && padName[:5] == "video" {
-				fmt.Printf("[%s] Creating video pipeline: demux -> queue -> input_capsfilter -> h264parse -> parse_queue -> capsfilter -> decoder -> output_capsfilter -> intervideosink\n", pipelineID)
+				fmt.Printf("[%s] Creating video pipeline: demux -> queue -> input_capsfilter -> h264parse -> parse_queue -> capsfilter -> decoder -> convert -> scale -> output_capsfilter -> intervideosink\n", pipelineID)
 				fmt.Printf("[%s] Video pad name: %s\n", pipelineID, padName)
 
 				// Create queue for video demux output with better settings for high frame rate
@@ -751,7 +798,7 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 					return
 				}
 				// Set output caps for raw video - use more flexible format to avoid negotiation issues
-				videoOutputCapsfilter.SetProperty("caps", gst.NewCapsFromString("video/x-raw"))
+				videoOutputCapsfilter.SetProperty("caps", gst.NewCapsFromString("video/x-raw,width=1920,height=1080"))
 
 				// Create H.264 decoder for video with better configuration
 				videoDecoder, err := gst.NewElementWithProperties("avdec_h264", map[string]interface{}{
@@ -772,6 +819,17 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 					return
 				}
 				videoConvert.SetProperty("sync", false) // Disable sync for real-time
+
+				// Create videoscale for proper video scaling
+				videoScale, err := gst.NewElementWithProperties("videoscale", map[string]interface{}{
+					"name": fmt.Sprintf("videoScale_%s_%s", pipelineID, padName),
+				})
+				if err != nil {
+					fmt.Printf("[%s] Failed to create video scale: %v\n", pipelineID, err)
+					return
+				}
+				videoScale.SetProperty("sync", false) // Disable sync for real-time
+				videoScale.SetProperty("method", 0)   // Fast scaling method
 
 				// Add elements to pipeline
 				if err := gp.pipeline.Add(videoDemuxQueue); err != nil {
@@ -800,6 +858,10 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 				}
 				if err := gp.pipeline.Add(videoConvert); err != nil {
 					fmt.Printf("[%s] Failed to add video convert to pipeline: %v\n", pipelineID, err)
+					return
+				}
+				if err := gp.pipeline.Add(videoScale); err != nil {
+					fmt.Printf("[%s] Failed to add video scale to pipeline: %v\n", pipelineID, err)
 					return
 				}
 				if err := gp.pipeline.Add(videoOutputCapsfilter); err != nil {
@@ -834,6 +896,10 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 				}
 				if err := videoConvert.SetState(gst.StatePlaying); err != nil {
 					fmt.Printf("[%s] Failed to set video convert state: %v\n", pipelineID, err)
+					return
+				}
+				if err := videoScale.SetState(gst.StatePlaying); err != nil {
+					fmt.Printf("[%s] Failed to set video scale state: %v\n", pipelineID, err)
 					return
 				}
 				if err := videoOutputCapsfilter.SetState(gst.StatePlaying); err != nil {
@@ -884,11 +950,17 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 				}
 				fmt.Printf("[%s] Successfully linked decoder to convert\n", pipelineID)
 
-				if videoConvert.GetStaticPad("src").Link(videoOutputCapsfilter.GetStaticPad("sink")) != gst.PadLinkOK {
-					fmt.Printf("[%s] Failed to link convert to output capsfilter\n", pipelineID)
+				if videoConvert.GetStaticPad("src").Link(videoScale.GetStaticPad("sink")) != gst.PadLinkOK {
+					fmt.Printf("[%s] Failed to link convert to scale\n", pipelineID)
 					return
 				}
-				fmt.Printf("[%s] Successfully linked convert to output capsfilter\n", pipelineID)
+				fmt.Printf("[%s] Successfully linked convert to scale\n", pipelineID)
+
+				if videoScale.GetStaticPad("src").Link(videoOutputCapsfilter.GetStaticPad("sink")) != gst.PadLinkOK {
+					fmt.Printf("[%s] Failed to link scale to output capsfilter\n", pipelineID)
+					return
+				}
+				fmt.Printf("[%s] Successfully linked scale to output capsfilter\n", pipelineID)
 
 				if videoOutputCapsfilter.GetStaticPad("src").Link(intervideosink1.GetStaticPad("sink")) != gst.PadLinkOK {
 					fmt.Printf("[%s] Failed to link output capsfilter to intervideosink\n", pipelineID)
@@ -896,10 +968,26 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 				}
 				fmt.Printf("[%s] Successfully linked output capsfilter to intervideosink\n", pipelineID)
 
-				fmt.Printf("[%s] Successfully linked video pipeline: demux -> queue -> input_capsfilter -> h264parse -> parse_queue -> capsfilter -> decoder -> output_capsfilter -> intervideosink\n", pipelineID)
+				fmt.Printf("[%s] Successfully linked video pipeline: demux -> queue -> input_capsfilter -> h264parse -> parse_queue -> capsfilter -> decoder -> convert -> scale -> output_capsfilter -> intervideosink\n", pipelineID)
 				fmt.Printf("[%s] Video pipeline creation completed successfully\n", pipelineID)
 				fmt.Printf("[%s] Video should now be flowing to intervideosink channel 'input1'\n", pipelineID)
 				fmt.Printf("[%s] Video demux queue settings: max-buffers=500, max-time=1s, min-threshold=200ms, leaky=0\n", pipelineID)
+
+				// Force videomixer refresh to prevent black screen
+				go func() {
+					time.Sleep(1 * time.Second) // Wait for video to start flowing
+					fmt.Printf("[%s] Forcing videomixer refresh to prevent black screen\n", pipelineID)
+
+					// Force videomixer to refresh its settings
+					gp.videomixer.SetProperty("sink-pad-0::alpha", 1.0)
+					gp.videomixer.SetProperty("sink-pad-0::xpos", 0)
+					gp.videomixer.SetProperty("sink-pad-0::ypos", 0)
+					gp.videomixer.SetProperty("sink-pad-0::width", 1920)
+					gp.videomixer.SetProperty("sink-pad-0::height", 1080)
+
+					fmt.Printf("[%s] Videomixer refresh completed\n", pipelineID)
+				}()
+
 				// Mark RTP as connected if we haven't already
 				if !gp.rtpConnected {
 					gp.rtpConnected = true
@@ -1285,6 +1373,21 @@ func (gp *GStreamerPipeline) switchToAsset() {
 	// Also set videomixer properties directly for better control
 	gp.videomixer.SetProperty("sink-pad-0::alpha", 0.0)
 	gp.videomixer.SetProperty("sink-pad-1::alpha", 1.0)
+
+	// Force videomixer refresh to prevent black screen
+	go func() {
+		time.Sleep(500 * time.Millisecond) // Wait for switch to complete
+		fmt.Printf("[%s] Forcing videomixer refresh after RTP switch to prevent black screen\n", gp.pipelineID)
+
+		// Force videomixer to refresh its settings
+		gp.videomixer.SetProperty("sink-pad-0::alpha", 1.0)
+		gp.videomixer.SetProperty("sink-pad-0::xpos", 0)
+		gp.videomixer.SetProperty("sink-pad-0::ypos", 0)
+		gp.videomixer.SetProperty("sink-pad-0::width", 1920)
+		gp.videomixer.SetProperty("sink-pad-0::height", 1080)
+
+		fmt.Printf("[%s] Videomixer refresh after RTP switch completed\n", gp.pipelineID)
+	}()
 }
 
 // switchToRTP switches the videomixer and audio mixer back to the RTP stream
@@ -1410,6 +1513,26 @@ func (gp *GStreamerPipeline) Start() error {
 	gp.running = true
 	fmt.Printf("[%s] GStreamer pipeline started successfully\n", gp.pipelineID)
 
+	// Pre-warm the videomixer with a dummy source to prevent black screen
+	go func() {
+		time.Sleep(2 * time.Second) // Wait for pipeline to stabilize
+		fmt.Printf("[%s] Pre-warming videomixer to prevent black screen issue\n", gp.pipelineID)
+
+		// Force videomixer to initialize with proper settings
+		gp.videomixer.SetProperty("sink-pad-0::alpha", 1.0)
+		gp.videomixer.SetProperty("sink-pad-1::alpha", 0.0)
+		gp.videomixer.SetProperty("sink-pad-0::xpos", 0)
+		gp.videomixer.SetProperty("sink-pad-0::ypos", 0)
+		gp.videomixer.SetProperty("sink-pad-0::width", 1920)
+		gp.videomixer.SetProperty("sink-pad-0::height", 1080)
+		gp.videomixer.SetProperty("sink-pad-1::xpos", 0)
+		gp.videomixer.SetProperty("sink-pad-1::ypos", 0)
+		gp.videomixer.SetProperty("sink-pad-1::width", 1920)
+		gp.videomixer.SetProperty("sink-pad-1::height", 1080)
+
+		fmt.Printf("[%s] Videomixer pre-warming completed\n", gp.pipelineID)
+	}()
+
 	// Start a timeout check to see if we get any pads from the demuxer
 	go func() {
 		time.Sleep(5 * time.Second) // Wait 5 seconds for pads to be created
@@ -1434,14 +1557,14 @@ func (gp *GStreamerPipeline) Start() error {
 		}
 	}()
 
-	// Start a timer to switch to asset after 1 minute (only if RTP is connected)
-	// go func() {
-	// 	time.Sleep(1 * time.Minute)
-	// 	if gp.running && gp.rtpConnected {
-	// 		fmt.Printf("[%s] 1 minute elapsed, switching to asset video\n", gp.pipelineID)
-	// 		gp.switchToAsset()
-	// 	}
-	// }()
+	// Start a timer to switch to asset after 10 seconds (only if RTP is connected)
+	go func() {
+		time.Sleep(10 * time.Second)
+		if gp.running && gp.rtpConnected {
+			fmt.Printf("[%s] 10 seconds elapsed, switching to asset video\n", gp.pipelineID)
+			gp.switchToAsset()
+		}
+	}()
 
 	return nil
 }
