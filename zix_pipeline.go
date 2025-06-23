@@ -381,6 +381,31 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 		return nil, fmt.Errorf("failed to create mpegtsmux: %v", err)
 	}
 
+	rtpmp2tpay, err := gst.NewElementWithProperties("rtpmp2tpay", map[string]interface{}{
+		"name": fmt.Sprintf("rtpmp2tpay_%s", pipelineID),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create rtpmp2tpay: %v", err)
+	}
+
+	rtpbin, err := gst.NewElementWithProperties("rtpbin", map[string]interface{}{
+		"latency":                uint(400), // Increase latency to handle jitter
+		"do-retransmission":      true,      // Enable retransmission
+		"rtp-profile":            2,         // AVP profile
+		"ntp-sync":               true,      // Enable NTP sync
+		"ntp-time-source":        3,         // Use running time
+		"max-rtcp-rtp-time-diff": 1000,      // Max allowed drift
+		"max-dropout-time":       45000,     // Max time to wait for missing packets
+		"max-misorder-time":      5000,      // Max reordering time
+		"buffer-mode":            1,         // Slave receiver mode
+		"do-lost":                true,      // Handle packet loss
+		"rtcp-sync-send-time":    true,      // Send RTCP sync packets
+		"name":                   fmt.Sprintf("rtpbin_%s", pipelineID),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create rtpbin: %v", err)
+	}
+
 	udpsink, err := gst.NewElementWithProperties("udpsink", map[string]interface{}{
 		"host":           outputHost,
 		"port":           outputPort,
@@ -432,12 +457,35 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 
 	// Configure MPEG-TS muxer for better compatibility
 	mpegtsmux.SetProperty("alignment", 7)
-	mpegtsmux.SetProperty("pat-interval", int64(100*1000000)) // 100ms
-	mpegtsmux.SetProperty("pmt-interval", int64(100*1000000)) // 100ms
-	mpegtsmux.SetProperty("pcr-interval", int64(20*1000000))  // 20ms
-	mpegtsmux.SetProperty("muxrate", 10080000)                // 10.08 Mbps
-	mpegtsmux.SetProperty("sync", false)                      // Disable sync for real-time
-	mpegtsmux.SetProperty("dts-method", 0)                    // Use default DTS method
+	mpegtsmux.SetProperty("pat-interval", int64(27000*1000000)) // 100ms
+	mpegtsmux.SetProperty("pmt-interval", int64(27000*1000000)) // 100ms
+	mpegtsmux.SetProperty("pcr-interval", int64(2700*1000000))  // 20ms
+	mpegtsmux.SetProperty("start-time", int64(500000000))
+	mpegtsmux.SetProperty("si-interval", int64(500))
+
+	// Configure RTP payloader for MPEG-TS output
+	rtpmp2tpay.SetProperty("mtu", 1400)
+	rtpmp2tpay.SetProperty("pt", 33)                // MPEG-TS payload type
+	rtpmp2tpay.SetProperty("perfect-rtptime", true) // Perfect RTP timing
+
+	// Create rtpbin for RTP session management
+	rtpbin, err = gst.NewElementWithProperties("rtpbin", map[string]interface{}{
+		"latency":                uint(400), // Increase latency to handle jitter
+		"do-retransmission":      true,      // Enable retransmission
+		"rtp-profile":            2,         // AVP profile
+		"ntp-sync":               true,      // Enable NTP sync
+		"ntp-time-source":        3,         // Use running time
+		"max-rtcp-rtp-time-diff": 1000,      // Max allowed drift
+		"max-dropout-time":       45000,     // Max time to wait for missing packets
+		"max-misorder-time":      5000,      // Max reordering time
+		"buffer-mode":            1,         // Slave receiver mode
+		"do-lost":                true,      // Handle packet loss
+		"rtcp-sync-send-time":    true,      // Send RTCP sync packets
+		"name":                   fmt.Sprintf("rtpbin_%s", pipelineID),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create rtpbin: %v", err)
+	}
 
 	// Add elements to pipeline
 	elements := []*gst.Element{
@@ -447,7 +495,8 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 		interaudio1, interaudio2, audiomixer,
 		videoQueue1, videoQueue2, videoconvert, x264enc, h264parse2, videoMuxerQueue,
 		audioQueue1, audioQueue2, aacparse1, audioconvert, audioresample, voaacenc, aacparse2,
-		audioMuxerQueue, mpegtsmux, udpsink,
+		audioMuxerQueue, mpegtsmux, rtpmp2tpay,
+		rtpbin, udpsink,
 	}
 
 	for _, element := range elements {
@@ -535,8 +584,29 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	}
 
 	// Link output branch
-	if err := mpegtsmux.Link(udpsink); err != nil {
-		return nil, fmt.Errorf("failed to link mpegtsmux to udpsink: %v", err)
+	if err := mpegtsmux.Link(rtpmp2tpay); err != nil {
+		return nil, fmt.Errorf("failed to link mpegtsmux to rtpmp2tpay: %v", err)
+	}
+
+	sendRtpSinkPad := rtpbin.GetRequestPad("send_rtp_sink_0")
+	if sendRtpSinkPad == nil {
+		return nil, fmt.Errorf("could not get 'send_rtp_sink_0' pad from rtpbin")
+	}
+
+	rtpmp2tpaySrcPad := rtpmp2tpay.GetStaticPad("src")
+	if rtpmp2tpaySrcPad == nil {
+		return nil, fmt.Errorf("could not get 'src' pad from rtpmp2tpay")
+	}
+	if rtpmp2tpaySrcPad.Link(sendRtpSinkPad) != gst.PadLinkOK {
+		return nil, fmt.Errorf("failed to link rtpmp2tpay src to rtpbin send_rtp_sink_0")
+	}
+
+	rtpSrcPad := rtpbin.GetStaticPad("send_rtp_src_0")
+	if rtpSrcPad == nil {
+		return nil, fmt.Errorf("could not get 'send_rtp_src_0' pad from rtpbin")
+	}
+	if rtpSrcPad.Link(udpsink.GetStaticPad("sink")) != gst.PadLinkOK {
+		return nil, fmt.Errorf("failed to link rtpbin send_rtp_src_0 to udpsink")
 	}
 
 	// Set up dynamic pad-added signal for tsdemux with safer error handling
