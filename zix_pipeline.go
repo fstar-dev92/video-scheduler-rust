@@ -2,11 +2,66 @@ package main
 
 import (
 	"fmt"
+	"log"
+	"os"
+	"runtime"
+	"runtime/debug"
 	"sync"
 	"time"
 
 	"github.com/go-gst/go-gst/gst"
 )
+
+// Setup logging and panic recovery
+func init() {
+	// Set up logging
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	log.SetOutput(os.Stdout)
+
+	// Set up panic recovery
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("PANIC RECOVERED: %v", r)
+			log.Printf("Stack trace: %s", debug.Stack())
+			os.Exit(1)
+		}
+	}()
+}
+
+// Debug helper functions
+func logMemoryStats() {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	log.Printf("Memory Stats - Alloc: %d MB, TotalAlloc: %d MB, Sys: %d MB, NumGC: %d",
+		m.Alloc/1024/1024, m.TotalAlloc/1024/1024, m.Sys/1024/1024, m.NumGC)
+}
+
+func logGoroutineCount() {
+	log.Printf("Goroutines: %d", runtime.NumGoroutine())
+}
+
+// Safe element creation with logging
+func safeNewElement(factoryName string) (*gst.Element, error) {
+	log.Printf("Creating element: %s", factoryName)
+	element, err := gst.NewElement(factoryName)
+	if err != nil {
+		log.Printf("Failed to create element %s: %v", factoryName, err)
+		return nil, err
+	}
+	log.Printf("Successfully created element: %s", factoryName)
+	return element, nil
+}
+
+// Safe element linking with logging
+func safeLink(src, sink *gst.Element, description string) error {
+	log.Printf("Linking: %s", description)
+	if err := src.Link(sink); err != nil {
+		log.Printf("Failed to link %s: %v", description, err)
+		return err
+	}
+	log.Printf("Successfully linked: %s", description)
+	return nil
+}
 
 // GStreamerPipeline represents a GStreamer pipeline for RTP stream processing with compositor and audio mixer
 type GStreamerPipeline struct {
@@ -17,6 +72,7 @@ type GStreamerPipeline struct {
 	audiomixer     *gst.Element
 	assetPipeline  *gst.Pipeline
 	mutex          sync.Mutex
+	padMutex       sync.Mutex // Mutex for protecting pad operations
 	assetVideoPath string
 	currentInput   string // "rtp" or "asset"
 	assetPlaying   bool
@@ -32,7 +88,17 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 		return nil, fmt.Errorf("failed to create pipeline: %v", err)
 	}
 
-	// Create elements
+	// Create the pipeline instance first so we can reference it in signal handlers
+	gp := &GStreamerPipeline{
+		pipeline:       pipeline,
+		assetVideoPath: assetVideoPath,
+		currentInput:   "rtp",
+		assetPlaying:   false,
+		stopChan:       make(chan struct{}),
+		running:        false,
+	}
+
+	// Create elements with proper error handling
 	udpsrc, err := gst.NewElement("udpsrc")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create udpsrc: %v", err)
@@ -48,7 +114,12 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 		return nil, fmt.Errorf("failed to create rtpmp2tdepay: %v", err)
 	}
 
-	tsdemux, err := gst.NewElement("tsdemux")
+	tsdemux, err := gst.NewElementWithProperties("tsdemux", map[string]interface{}{
+		"name":               "tsdemux",
+		"send-scte35-events": true, // Enable SCTE-35Parse
+		"latency":            1000,
+	})
+
 	if err != nil {
 		return nil, fmt.Errorf("failed to create tsdemux: %v", err)
 	}
@@ -131,7 +202,7 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 		return nil, fmt.Errorf("failed to create compositor: %v", err)
 	}
 
-	// Configure compositor sink pads for proper positioning
+	// Configure compositor sink pads for proper positioning with null checks
 	pad1 := compositor.GetStaticPad("sink_0")
 	if pad1 != nil {
 		pad1.SetProperty("xpos", 0)
@@ -152,12 +223,12 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 
 	// Create audio mixer
 	audiomixer, err := gst.NewElement("audiomixer")
-	audiomixer.SetProperty("name", "audiomixer")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create audiomixer: %v", err)
 	}
+	audiomixer.SetProperty("name", "audiomixer")
 
-	// Video processing elements
+	// Create video processing elements for RTP stream (input1)
 	videoQueue1, err := gst.NewElement("queue")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create video queue 1: %v", err)
@@ -166,6 +237,7 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	videoQueue1.SetProperty("max-size-time", uint64(500*1000000))     // 500ms
 	videoQueue1.SetProperty("min-threshold-time", uint64(50*1000000)) // 50ms
 
+	// Create video processing elements for asset stream (input2)
 	videoQueue2, err := gst.NewElement("queue")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create video queue 2: %v", err)
@@ -174,6 +246,7 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	videoQueue2.SetProperty("max-size-time", uint64(500*1000000))     // 500ms
 	videoQueue2.SetProperty("min-threshold-time", uint64(50*1000000)) // 50ms
 
+	// Create video processing chain elements
 	videoconvert, err := gst.NewElement("videoconvert")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create videoconvert: %v", err)
@@ -189,7 +262,7 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 		return nil, fmt.Errorf("failed to create h264parse2: %v", err)
 	}
 
-	// Audio processing elements
+	// Create audio processing elements for RTP stream (audio1)
 	audioQueue1, err := gst.NewElement("queue")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create audio queue 1: %v", err)
@@ -198,6 +271,7 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	audioQueue1.SetProperty("max-size-time", uint64(500*1000000))     // 500ms
 	audioQueue1.SetProperty("min-threshold-time", uint64(50*1000000)) // 50ms
 
+	// Create audio processing elements for asset stream (audio2)
 	audioQueue2, err := gst.NewElement("queue")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create audio queue 2: %v", err)
@@ -206,6 +280,7 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	audioQueue2.SetProperty("max-size-time", uint64(500*1000000))     // 500ms
 	audioQueue2.SetProperty("min-threshold-time", uint64(50*1000000)) // 50ms
 
+	// Create audio processing chain elements
 	aacparse1, err := gst.NewElement("aacparse")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create aacparse1: %v", err)
@@ -307,7 +382,7 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 		intervideo1, intervideo2, compositor,
 		interaudio1, interaudio2, audiomixer,
 		videoQueue1, videoQueue2, videoconvert, x264enc, h264parse2,
-		audioQueue1, audioQueue2, audioconvert, audioresample, voaacenc, aacparse2,
+		audioQueue1, audioQueue2, aacparse1, audioconvert, audioresample, voaacenc, aacparse2,
 		audioMuxerQueue, mpegtsmux, rtpmp2tpay, udpsink,
 	}
 
@@ -401,149 +476,64 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 		return nil, fmt.Errorf("failed to link rtpmp2tpay to udpsink: %v", err)
 	}
 
-	// Set up dynamic pad-added signal for tsdemux
+	// Set up dynamic pad-added signal for tsdemux with safer error handling
 	tsdemux.Connect("pad-added", func(self *gst.Element, pad *gst.Pad) {
-		fmt.Printf("Demuxer pad added: %s\n", pad.GetName())
 
-		padName := pad.GetName()
-		var targetElement *gst.Element
-		var capsFilter *gst.Element
-		var converter *gst.Element
-		var queue *gst.Element
-		var err error
+		fmt.Printf("##############################################\n")
+		// Use a goroutine to handle the pad addition asynchronously to avoid blocking the signal
+		go func() {
+			// Add a small delay to ensure the pad is fully created
+			time.Sleep(10 * time.Millisecond)
 
-		// Check pad name to determine if it's video or audio
-		if len(padName) >= 5 && padName[:5] == "video" {
-			targetElement = intervideosink1
-			fmt.Printf("Linking video pad %s to intervideosink1\n", padName)
+			// Lock the pad mutex to ensure thread safety
+			gp.padMutex.Lock()
+			defer gp.padMutex.Unlock()
 
-			// Create video caps filter - more flexible for different H.264 formats
-			capsFilter, err = gst.NewElement("capsfilter")
-			if err != nil {
-				fmt.Printf("Failed to create video caps filter: %v\n", err)
-				return
-			}
-			capsFilter.SetProperty("caps", gst.NewCapsFromString("video/x-h264"))
-
-			// Create H.264 parser for better compatibility
-			converter, err = gst.NewElement("h264parse")
-			if err != nil {
-				fmt.Printf("Failed to create h264parse: %v\n", err)
+			// Check if pipeline is still running
+			if !gp.running {
+				fmt.Printf("Pipeline is not running, ignoring pad addition\n")
 				return
 			}
 
-			// Create queue for video buffering
-			queue, err = gst.NewElement("queue")
-			if err != nil {
-				fmt.Printf("Failed to create video queue: %v\n", err)
-				return
-			}
-			queue.SetProperty("max-size-buffers", 50)
-			queue.SetProperty("max-size-time", uint64(200*1000000))     // 200ms
-			queue.SetProperty("min-threshold-time", uint64(50*1000000)) // 50ms
-
-		} else if len(padName) >= 5 && padName[:5] == "audio" {
-			targetElement = interaudiosink1
-			fmt.Printf("Linking audio pad %s to interaudiosink1\n", padName)
-
-			// Create audio caps filter - more flexible for different audio formats
-			capsFilter, err = gst.NewElement("capsfilter")
-			if err != nil {
-				fmt.Printf("Failed to create audio caps filter: %v\n", err)
-				return
-			}
-			capsFilter.SetProperty("caps", gst.NewCapsFromString("audio/mpeg"))
-
-			// Create AAC parser for better compatibility
-			converter, err = gst.NewElement("aacparse")
-			if err != nil {
-				fmt.Printf("Failed to create aacparse: %v\n", err)
+			if pad == nil {
+				fmt.Printf("Warning: Received nil pad in pad-added signal\n")
 				return
 			}
 
-			// Create queue for audio buffering
-			queue, err = gst.NewElement("queue")
-			if err != nil {
-				fmt.Printf("Failed to create audio queue: %v\n", err)
+			padName := pad.GetName()
+			if padName == "" {
+				fmt.Printf("Warning: Received pad with empty name\n")
 				return
 			}
-			queue.SetProperty("max-size-buffers", 50)
-			queue.SetProperty("max-size-time", uint64(200*1000000))     // 200ms
-			queue.SetProperty("min-threshold-time", uint64(50*1000000)) // 50ms
 
-		} else {
-			fmt.Printf("Unknown demuxer pad: %s\n", padName)
-			return
-		}
+			fmt.Printf("Demuxer pad added: %s\n", padName)
 
-		// Add elements to pipeline
-		if err := pipeline.Add(capsFilter); err != nil {
-			fmt.Printf("Failed to add caps filter to pipeline: %v\n", err)
-			return
-		}
-		if err := pipeline.Add(converter); err != nil {
-			fmt.Printf("Failed to add converter to pipeline: %v\n", err)
-			return
-		}
-		if err := pipeline.Add(queue); err != nil {
-			fmt.Printf("Failed to add queue to pipeline: %v\n", err)
-			return
-		}
-
-		// Get the sink pad from the target element
-		sinkPad := targetElement.GetStaticPad("sink")
-		if sinkPad == nil {
-			fmt.Printf("Failed to get sink pad from target element\n")
-			return
-		}
-
-		// Set elements to PLAYING state
-		capsFilter.SetState(gst.StatePlaying)
-		converter.SetState(gst.StatePlaying)
-		queue.SetState(gst.StatePlaying)
-
-		// Link the chain: demuxer pad -> caps filter -> converter -> queue -> target element
-		if pad.Link(capsFilter.GetStaticPad("sink")) != gst.PadLinkOK {
-			fmt.Printf("Failed to link demuxer pad to caps filter\n")
-			// Try to get more information about the pad
-			padCaps := pad.GetCurrentCaps()
-			if padCaps != nil {
-				fmt.Printf("Demuxer pad caps: %s\n", padCaps.String())
-			}
-			return
-		}
-
-		if capsFilter.GetStaticPad("src").Link(converter.GetStaticPad("sink")) != gst.PadLinkOK {
-			fmt.Printf("Failed to link caps filter to converter\n")
-			return
-		}
-
-		if converter.GetStaticPad("src").Link(queue.GetStaticPad("sink")) != gst.PadLinkOK {
-			fmt.Printf("Failed to link converter to queue\n")
-			return
-		}
-
-		if queue.GetStaticPad("src").Link(sinkPad) == gst.PadLinkOK {
-			fmt.Printf("Successfully linked demuxer pad %s to %s via caps filter, converter, and queue\n", padName, targetElement.GetName())
-		} else {
-			fmt.Printf("Failed to link queue to target element\n")
-			// Try to get more information about the target pad
-			sinkPadCaps := sinkPad.GetCurrentCaps()
-			if sinkPadCaps != nil {
-				fmt.Printf("Target sink pad caps: %s\n", sinkPadCaps.String())
-			}
-
-			// Try direct linking as fallback
-			fmt.Printf("Attempting direct linking as fallback...\n")
-			if pad.Link(sinkPad) == gst.PadLinkOK {
-				fmt.Printf("Successfully linked demuxer pad %s directly to %s\n", padName, targetElement.GetName())
+			// Check pad name to determine if it's video or audio
+			if len(padName) >= 5 && padName[:5] == "video" {
+				fmt.Printf("Linking video pad %s to intervideosink1\n", padName)
+				// Link video pad directly to intervideosink like in scte35_handler.go
+				result := pad.Link(intervideosink1.GetStaticPad("sink"))
+				if result != gst.PadLinkOK {
+					fmt.Printf("Failed to link video pad: %v\n", result)
+				} else {
+					fmt.Printf("Successfully linked video pad to intervideosink\n")
+				}
+			} else if len(padName) >= 5 && padName[:5] == "audio" {
+				fmt.Printf("Linking audio pad %s to interaudiosink1\n", padName)
+				// Link audio pad directly to interaudiosink like in scte35_handler.go
+				result := pad.Link(interaudiosink1.GetStaticPad("sink"))
+				if result != gst.PadLinkOK {
+					fmt.Printf("Failed to link audio pad: %v\n", result)
+				} else {
+					fmt.Printf("Successfully linked audio pad to interaudiosink\n")
+				}
 			} else {
-				fmt.Printf("Direct linking also failed for demuxer pad %s\n", padName)
+				fmt.Printf("Unknown demuxer pad: %s\n", padName)
 			}
-		}
+		}()
 	})
 
-	// Set up bus watch for the main pipeline
+	// Set up bus watch for the main pipeline with safer message handling
 	bus := pipeline.GetBus()
 	go func() {
 		for {
@@ -565,22 +555,19 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 			case gst.MessageInfo:
 				ginfo := msg.ParseInfo()
 				fmt.Printf("Pipeline info: %s\n", ginfo.Error())
+			case gst.MessageEOS:
+				fmt.Printf("Pipeline reached end of stream\n")
 			}
 		}
 	}()
 
-	return &GStreamerPipeline{
-		pipeline:       pipeline,
-		demux:          tsdemux,
-		mux:            mpegtsmux,
-		compositor:     compositor,
-		audiomixer:     audiomixer,
-		assetVideoPath: assetVideoPath,
-		currentInput:   "rtp",
-		assetPlaying:   false,
-		stopChan:       make(chan struct{}),
-		running:        false,
-	}, nil
+	// Assign elements to the pipeline instance
+	gp.demux = tsdemux
+	gp.mux = mpegtsmux
+	gp.compositor = compositor
+	gp.audiomixer = audiomixer
+
+	return gp, nil
 }
 
 // createAssetPipeline creates a pipeline for playing the local asset video file
@@ -621,9 +608,11 @@ func (gp *GStreamerPipeline) createAssetPipeline() error {
 	playbin.SetProperty("audio-sink", interaudiosink)
 
 	// Add playbin to pipeline
-	pipeline.Add(playbin)
+	if err := pipeline.Add(playbin); err != nil {
+		return fmt.Errorf("failed to add playbin to pipeline: %v", err)
+	}
 
-	// Set up bus watch
+	// Set up bus watch with safer message handling
 	bus := pipeline.GetBus()
 	go func() {
 		for {
@@ -673,12 +662,15 @@ func (gp *GStreamerPipeline) switchToAsset() {
 	}
 
 	// Set asset pipeline to PLAYING
-	gp.assetPipeline.SetState(gst.StatePlaying)
+	if err := gp.assetPipeline.SetState(gst.StatePlaying); err != nil {
+		fmt.Printf("Failed to set asset pipeline state: %v\n", err)
+		return
+	}
 
 	gp.currentInput = "asset"
 	gp.assetPlaying = true
 
-	// Switch compositor to show asset (input2)
+	// Switch compositor to show asset (input2) with null checks
 	pad1 := gp.compositor.GetStaticPad("sink_0")
 	pad2 := gp.compositor.GetStaticPad("sink_1")
 	if pad1 != nil && pad2 != nil {
@@ -702,14 +694,16 @@ func (gp *GStreamerPipeline) switchToRTP() {
 
 	// Stop asset pipeline
 	if gp.assetPipeline != nil {
-		gp.assetPipeline.SetState(gst.StateNull)
+		if err := gp.assetPipeline.SetState(gst.StateNull); err != nil {
+			fmt.Printf("Failed to stop asset pipeline: %v\n", err)
+		}
 		gp.assetPipeline = nil
 	}
 
 	gp.currentInput = "rtp"
 	gp.assetPlaying = false
 
-	// Switch compositor back to RTP stream (input1)
+	// Switch compositor back to RTP stream (input1) with null checks
 	pad1 := gp.compositor.GetStaticPad("sink_0")
 	pad2 := gp.compositor.GetStaticPad("sink_1")
 	if pad1 != nil && pad2 != nil {
@@ -732,14 +726,16 @@ func (gp *GStreamerPipeline) stopAsset() {
 
 	// Stop asset pipeline
 	if gp.assetPipeline != nil {
-		gp.assetPipeline.SetState(gst.StateNull)
+		if err := gp.assetPipeline.SetState(gst.StateNull); err != nil {
+			fmt.Printf("Failed to stop asset pipeline: %v\n", err)
+		}
 		gp.assetPipeline = nil
 	}
 
 	gp.assetPlaying = false
 	gp.currentInput = "rtp"
 
-	// Switch compositor back to RTP stream (input1)
+	// Switch compositor back to RTP stream (input1) with null checks
 	pad1 := gp.compositor.GetStaticPad("sink_0")
 	pad2 := gp.compositor.GetStaticPad("sink_1")
 	if pad1 != nil && pad2 != nil {
@@ -783,13 +779,17 @@ func (gp *GStreamerPipeline) Stop() {
 
 	// Stop asset pipeline if running
 	if gp.assetPipeline != nil {
-		gp.assetPipeline.SetState(gst.StateNull)
+		if err := gp.assetPipeline.SetState(gst.StateNull); err != nil {
+			fmt.Printf("Failed to stop asset pipeline: %v\n", err)
+		}
 		gp.assetPipeline = nil
 	}
 
 	// Set pipeline state to null
 	if gp.pipeline != nil {
-		gp.pipeline.SetState(gst.StateNull)
+		if err := gp.pipeline.SetState(gst.StateNull); err != nil {
+			fmt.Printf("Failed to stop main pipeline: %v\n", err)
+		}
 	}
 
 	fmt.Println("GStreamer pipeline stopped")
