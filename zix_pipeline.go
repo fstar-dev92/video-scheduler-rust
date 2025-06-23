@@ -572,7 +572,7 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 
 			// Check pad name to determine if it's video or audio
 			if len(padName) >= 5 && padName[:5] == "video" {
-				fmt.Printf("[%s] Creating video pipeline: demux -> queue -> input_capsfilter -> h264parse -> capsfilter -> decoder -> output_capsfilter -> intervideosink\n", pipelineID)
+				fmt.Printf("[%s] Creating video pipeline: demux -> queue -> input_capsfilter -> h264parse -> parse_queue -> capsfilter -> decoder -> output_capsfilter -> intervideosink\n", pipelineID)
 
 				// Create queue for video demux output with better settings for high frame rate
 				videoDemuxQueue, err := gst.NewElementWithProperties("queue", map[string]interface{}{
@@ -597,8 +597,8 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 					fmt.Printf("[%s] Failed to create video input capsfilter: %v\n", pipelineID, err)
 					return
 				}
-				// Set caps for H.264 video with proper format
-				videoInputCapsfilter.SetProperty("caps", gst.NewCapsFromString("video/x-h264,alignment=au,stream-format=byte-stream"))
+				// Set more flexible caps for H.264 video to handle various formats
+				videoInputCapsfilter.SetProperty("caps", gst.NewCapsFromString("video/x-h264"))
 
 				// Create h264parse for video demux output with better configuration
 				videoH264parse, err := gst.NewElementWithProperties("h264parse", map[string]interface{}{
@@ -608,11 +608,25 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 					fmt.Printf("[%s] Failed to create video h264parse: %v\n", pipelineID, err)
 					return
 				}
-				videoH264parse.SetProperty("sync", false)                // Disable sync for real-time
+				// Use only valid h264parse properties
+				videoH264parse.SetProperty("config-interval", -1)        // Send SPS/PPS with every IDR frame
 				videoH264parse.SetProperty("disable-passthrough", false) // Allow passthrough when possible
-				videoH264parse.SetProperty("config-interval", -1)        // Don't force config interval
-				videoH264parse.SetProperty("alignment", 0)               // No alignment requirement
-				videoH264parse.SetProperty("output-format", 0)           // Output format: NAL
+				videoH264parse.SetProperty("update-timecode", true)      // Update timecode values
+
+				// Create a buffer queue before h264parse to collect parameter sets
+				videoParseQueue, err := gst.NewElementWithProperties("queue", map[string]interface{}{
+					"name": fmt.Sprintf("videoParseQueue_%s_%s", pipelineID, padName),
+				})
+				if err != nil {
+					fmt.Printf("[%s] Failed to create video parse queue: %v\n", pipelineID, err)
+					return
+				}
+				// Larger buffer to ensure we collect enough data including parameter sets
+				videoParseQueue.SetProperty("max-size-buffers", 100)                   // Increased buffer size
+				videoParseQueue.SetProperty("max-size-time", uint64(500*1000000))      // 500ms to collect more data
+				videoParseQueue.SetProperty("min-threshold-time", uint64(200*1000000)) // 200ms threshold
+				videoParseQueue.SetProperty("sync", false)                             // Disable sync for real-time
+				videoParseQueue.SetProperty("leaky", 0)                                // No leaking to ensure parameter sets are preserved
 
 				// Create capsfilter to ensure proper H.264 format
 				videoCapsfilter, err := gst.NewElementWithProperties("capsfilter", map[string]interface{}{
@@ -643,8 +657,8 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 					fmt.Printf("[%s] Failed to create video output capsfilter: %v\n", pipelineID, err)
 					return
 				}
-				// Set output caps for raw video - more flexible format
-				videoOutputCapsfilter.SetProperty("caps", gst.NewCapsFromString("video/x-raw,format=I420,width=1920,height=1080"))
+				// Set output caps for raw video - very flexible format to avoid conversion issues
+				videoOutputCapsfilter.SetProperty("caps", gst.NewCapsFromString("video/x-raw"))
 
 				// Add elements to pipeline
 				if err := gp.pipeline.Add(videoDemuxQueue); err != nil {
@@ -657,6 +671,10 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 				}
 				if err := gp.pipeline.Add(videoH264parse); err != nil {
 					fmt.Printf("[%s] Failed to add video h264parse to pipeline: %v\n", pipelineID, err)
+					return
+				}
+				if err := gp.pipeline.Add(videoParseQueue); err != nil {
+					fmt.Printf("[%s] Failed to add video parse queue to pipeline: %v\n", pipelineID, err)
 					return
 				}
 				if err := gp.pipeline.Add(videoCapsfilter); err != nil {
@@ -683,6 +701,10 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 				}
 				if err := videoH264parse.SetState(gst.StatePlaying); err != nil {
 					fmt.Printf("[%s] Failed to set video h264parse state: %v\n", pipelineID, err)
+					return
+				}
+				if err := videoParseQueue.SetState(gst.StatePlaying); err != nil {
+					fmt.Printf("[%s] Failed to set video parse queue state: %v\n", pipelineID, err)
 					return
 				}
 				if err := videoCapsfilter.SetState(gst.StatePlaying); err != nil {
@@ -717,11 +739,17 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 				}
 				fmt.Printf("[%s] Successfully linked input capsfilter to h264parse\n", pipelineID)
 
-				if videoH264parse.GetStaticPad("src").Link(videoCapsfilter.GetStaticPad("sink")) != gst.PadLinkOK {
-					fmt.Printf("[%s] Failed to link h264parse to capsfilter\n", pipelineID)
+				if videoH264parse.GetStaticPad("src").Link(videoParseQueue.GetStaticPad("sink")) != gst.PadLinkOK {
+					fmt.Printf("[%s] Failed to link h264parse to parse queue\n", pipelineID)
 					return
 				}
-				fmt.Printf("[%s] Successfully linked h264parse to capsfilter\n", pipelineID)
+				fmt.Printf("[%s] Successfully linked h264parse to parse queue\n", pipelineID)
+
+				if videoParseQueue.GetStaticPad("src").Link(videoCapsfilter.GetStaticPad("sink")) != gst.PadLinkOK {
+					fmt.Printf("[%s] Failed to link parse queue to capsfilter\n", pipelineID)
+					return
+				}
+				fmt.Printf("[%s] Successfully linked parse queue to capsfilter\n", pipelineID)
 
 				if videoCapsfilter.GetStaticPad("src").Link(videoDecoder.GetStaticPad("sink")) != gst.PadLinkOK {
 					fmt.Printf("[%s] Failed to link capsfilter to decoder\n", pipelineID)
@@ -741,7 +769,7 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 				}
 				fmt.Printf("[%s] Successfully linked output capsfilter to intervideosink\n", pipelineID)
 
-				fmt.Printf("[%s] Successfully linked video pipeline: demux -> queue -> input_capsfilter -> h264parse -> capsfilter -> decoder -> output_capsfilter -> intervideosink\n", pipelineID)
+				fmt.Printf("[%s] Successfully linked video pipeline: demux -> queue -> input_capsfilter -> h264parse -> parse_queue -> capsfilter -> decoder -> output_capsfilter -> intervideosink\n", pipelineID)
 				// Mark RTP as connected if we haven't already
 				if !gp.rtpConnected {
 					gp.rtpConnected = true
