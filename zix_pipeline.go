@@ -64,12 +64,12 @@ func safeLink(src, sink *gst.Element, description string) error {
 	return nil
 }
 
-// GStreamerPipeline represents a GStreamer pipeline for RTP stream processing with compositor and audio mixer
+// GStreamerPipeline represents a GStreamer pipeline for RTP stream processing with videomixer and audio mixer
 type GStreamerPipeline struct {
 	pipeline       *gst.Pipeline
 	demux          *gst.Element
 	mux            *gst.Element
-	compositor     *gst.Element
+	videomixer     *gst.Element
 	audiomixer     *gst.Element
 	assetPipeline  *gst.Pipeline
 	mutex          sync.Mutex
@@ -84,7 +84,7 @@ type GStreamerPipeline struct {
 	pipelineID     string      // Add this field
 }
 
-// NewGStreamerPipeline creates a new GStreamer pipeline for RTP processing with compositor and audio mixer
+// NewGStreamerPipeline creates a new GStreamer pipeline for RTP processing with videomixer and audio mixer
 func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, outputPort int, assetVideoPath string) (*GStreamerPipeline, error) {
 	// Generate a unique pipeline ID (you could also accept this as a parameter)
 	pipelineID := fmt.Sprintf("pipeline_%d", time.Now().UnixNano())
@@ -207,43 +207,44 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 		return nil, fmt.Errorf("failed to create interaudiosrc2: %v", err)
 	}
 
-	// Create video mixer (compositor)
-	compositor, err := gst.NewElementWithProperties("compositor", map[string]interface{}{
-		"name": fmt.Sprintf("compositor_%s", pipelineID),
+	// Create video mixer (videomixer instead of compositor)
+	videomixer, err := gst.NewElementWithProperties("videomixer", map[string]interface{}{
+		"name": fmt.Sprintf("videomixer_%s", pipelineID),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to create compositor: %v", err)
+		return nil, fmt.Errorf("failed to create videomixer: %v", err)
 	}
 
-	// Configure compositor sink pads for proper positioning with null checks
-	pad1 := compositor.GetStaticPad("sink_0")
+	// Configure videomixer sink pads for proper positioning with null checks
+	pad1 := videomixer.GetStaticPad("sink_0")
 	if pad1 != nil {
 		pad1.SetProperty("xpos", 0)
 		pad1.SetProperty("ypos", 0)
 		pad1.SetProperty("width", 1920)
 		pad1.SetProperty("height", 1080)
 		pad1.SetProperty("alpha", 1.0) // input1 visible
-		fmt.Printf("[%s] Configured compositor sink_0 (RTP input) with alpha=1.0\n", pipelineID)
+		fmt.Printf("[%s] Configured videomixer sink_0 (RTP input) with alpha=1.0\n", pipelineID)
 	} else {
-		fmt.Printf("[%s] Warning: Could not get compositor sink_0 pad\n", pipelineID)
+		fmt.Printf("[%s] Warning: Could not get videomixer sink_0 pad\n", pipelineID)
 	}
 
-	pad2 := compositor.GetStaticPad("sink_1")
+	pad2 := videomixer.GetStaticPad("sink_1")
 	if pad2 != nil {
 		pad2.SetProperty("xpos", 0)
 		pad2.SetProperty("ypos", 0)
 		pad2.SetProperty("width", 1920)
 		pad2.SetProperty("height", 1080)
 		pad2.SetProperty("alpha", 0.0) // input2 hidden
-		fmt.Printf("[%s] Configured compositor sink_1 (asset input) with alpha=0.0\n", pipelineID)
+		fmt.Printf("[%s] Configured videomixer sink_1 (asset input) with alpha=0.0\n", pipelineID)
 	} else {
-		fmt.Printf("[%s] Warning: Could not get compositor sink_1 pad\n", pipelineID)
+		fmt.Printf("[%s] Warning: Could not get videomixer sink_1 pad\n", pipelineID)
 	}
 
-	// Set compositor properties for better video handling
-	compositor.SetProperty("background", 1)               // Black background
-	compositor.SetProperty("zero-size-is-unscaled", true) // Don't scale zero-size inputs
-	compositor.SetProperty("operator", 0)                 // Overlay operator
+	// Set videomixer properties for better video handling
+	videomixer.SetProperty("background", 1)               // Black background
+	videomixer.SetProperty("zero-size-is-unscaled", true) // Don't scale zero-size inputs
+	videomixer.SetProperty("sink-pad-0::alpha", 1.0)      // Set initial alpha for sink_0
+	videomixer.SetProperty("sink-pad-1::alpha", 0.0)      // Set initial alpha for sink_1
 
 	// Create audio mixer
 	audiomixer, err := gst.NewElementWithProperties("audiomixer", map[string]interface{}{
@@ -283,6 +284,16 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 		return nil, fmt.Errorf("failed to create videoconvert: %v", err)
 	}
 
+	// Create capsfilter before videomixer for better format negotiation
+	videomixerCapsfilter, err := gst.NewElementWithProperties("capsfilter", map[string]interface{}{
+		"name": fmt.Sprintf("videomixerCapsfilter_%s", pipelineID),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create videomixer capsfilter: %v", err)
+	}
+	// Set flexible caps for videomixer input
+	videomixerCapsfilter.SetProperty("caps", gst.NewCapsFromString("video/x-raw"))
+
 	x264enc, err := gst.NewElementWithProperties("x264enc", map[string]interface{}{
 		"name": fmt.Sprintf("x264enc_%s", pipelineID),
 	})
@@ -318,9 +329,12 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	if err != nil {
 		return nil, fmt.Errorf("failed to create audio queue 1: %v", err)
 	}
-	audioQueue1.SetProperty("max-size-buffers", 100)
-	audioQueue1.SetProperty("max-size-time", uint64(700*1000000)) // 200ms instead of 500ms
-	audioQueue1.SetProperty("min-threshold-time", uint64(50*1000000))
+	audioQueue1.SetProperty("max-size-buffers", 300)                   // Increased for audio continuity
+	audioQueue1.SetProperty("max-size-time", uint64(1000*1000000))     // Increased to 1 second
+	audioQueue1.SetProperty("min-threshold-time", uint64(200*1000000)) // Increased to 200ms
+	audioQueue1.SetProperty("sync", false)                             // Disable sync for real-time
+	audioQueue1.SetProperty("leaky", 0)                                // No leaking for audio continuity
+	audioQueue1.SetProperty("max-size-bytes", 0)                       // No byte limit
 
 	// Create audio processing elements for asset stream (audio2)
 	audioQueue2, err := gst.NewElementWithProperties("queue", map[string]interface{}{
@@ -329,9 +343,12 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	if err != nil {
 		return nil, fmt.Errorf("failed to create audio queue 2: %v", err)
 	}
-	audioQueue2.SetProperty("max-size-buffers", 100)
-	audioQueue2.SetProperty("max-size-time", uint64(700*1000000)) // 200ms instead of 500ms
-	audioQueue2.SetProperty("min-threshold-time", uint64(50*1000000))
+	audioQueue2.SetProperty("max-size-buffers", 300)                   // Increased for audio continuity
+	audioQueue2.SetProperty("max-size-time", uint64(1000*1000000))     // Increased to 1 second
+	audioQueue2.SetProperty("min-threshold-time", uint64(200*1000000)) // Increased to 200ms
+	audioQueue2.SetProperty("sync", false)                             // Disable sync for real-time
+	audioQueue2.SetProperty("leaky", 0)                                // No leaking for audio continuity
+	audioQueue2.SetProperty("max-size-bytes", 0)                       // No byte limit
 
 	// Create audio processing chain elements
 	aacparse1, err := gst.NewElementWithProperties("aacparse", map[string]interface{}{
@@ -376,12 +393,12 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	if err != nil {
 		return nil, fmt.Errorf("failed to create audio muxer queue: %v", err)
 	}
-	audioMuxerQueue.SetProperty("max-size-buffers", 250) // Increase buffer limit
-	audioMuxerQueue.SetProperty("max-size-time", uint64(500*1000000))
-	audioMuxerQueue.SetProperty("min-threshold-time", uint64(50*1000000))
-	audioMuxerQueue.SetProperty("sync", false)       // Disable sync for real-time
-	audioMuxerQueue.SetProperty("leaky", 0)          // No leaking
-	audioMuxerQueue.SetProperty("max-size-bytes", 0) // No byte limit
+	audioMuxerQueue.SetProperty("max-size-buffers", 500)                   // Increased significantly for audio continuity
+	audioMuxerQueue.SetProperty("max-size-time", uint64(1000*1000000))     // Increased to 1 second
+	audioMuxerQueue.SetProperty("min-threshold-time", uint64(200*1000000)) // Increased to 200ms
+	audioMuxerQueue.SetProperty("sync", false)                             // Disable sync for real-time
+	audioMuxerQueue.SetProperty("leaky", 0)                                // No leaking for audio continuity
+	audioMuxerQueue.SetProperty("max-size-bytes", 0)                       // No byte limit
 
 	// Muxer and output elements
 	mpegtsmux, err := gst.NewElementWithProperties("mpegtsmux", map[string]interface{}{
@@ -501,9 +518,9 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	elements := []*gst.Element{
 		udpsrc, udpCapsfilter, rtpmp2tdepay, tsdemux,
 		intervideosink1, interaudiosink1,
-		intervideo1, intervideo2, compositor,
+		intervideo1, intervideo2, videomixer,
 		interaudio1, interaudio2, audiomixer,
-		videoQueue1, videoQueue2, videoconvert, x264enc, h264parse2, videoMuxerQueue,
+		videoQueue1, videoQueue2, videoconvert, videomixerCapsfilter, x264enc, h264parse2, videoMuxerQueue,
 		audioQueue1, audioQueue2, aacparse1, audioconvert, audioresample, voaacenc, aacparse2,
 		audioMuxerQueue, mpegtsmux, rtpmp2tpay,
 		rtpbin, udpsink,
@@ -537,17 +554,20 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	}
 
 	// Link video processing chain
-	if err := videoQueue1.Link(compositor); err != nil {
-		return nil, fmt.Errorf("failed to link videoQueue1 to compositor: %v", err)
+	if err := videoQueue1.Link(videomixer); err != nil {
+		return nil, fmt.Errorf("failed to link videoQueue1 to videomixer: %v", err)
 	}
-	if err := videoQueue2.Link(compositor); err != nil {
-		return nil, fmt.Errorf("failed to link videoQueue2 to compositor: %v", err)
+	if err := videoQueue2.Link(videomixer); err != nil {
+		return nil, fmt.Errorf("failed to link videoQueue2 to videomixer: %v", err)
 	}
-	if err := compositor.Link(videoconvert); err != nil {
-		return nil, fmt.Errorf("failed to link compositor to videoconvert: %v", err)
+	if err := videomixer.Link(videoconvert); err != nil {
+		return nil, fmt.Errorf("failed to link videomixer to videoconvert: %v", err)
 	}
-	if err := videoconvert.Link(x264enc); err != nil {
-		return nil, fmt.Errorf("failed to link videoconvert to x264enc: %v", err)
+	if err := videoconvert.Link(videomixerCapsfilter); err != nil {
+		return nil, fmt.Errorf("failed to link videoconvert to videomixer capsfilter: %v", err)
+	}
+	if err := videomixerCapsfilter.Link(x264enc); err != nil {
+		return nil, fmt.Errorf("failed to link videomixer capsfilter to x264enc: %v", err)
 	}
 	if err := x264enc.Link(h264parse2); err != nil {
 		return nil, fmt.Errorf("failed to link x264enc to h264parse2: %v", err)
@@ -664,12 +684,13 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 					fmt.Printf("[%s] Failed to create video demux queue: %v\n", pipelineID, err)
 					return
 				}
-				// Increase buffer sizes for high frame rate (59.94 fps)
-				videoDemuxQueue.SetProperty("max-size-buffers", 200)                   // Increased from 50
-				videoDemuxQueue.SetProperty("max-size-time", uint64(500*1000000))      // Increased to 500ms
-				videoDemuxQueue.SetProperty("min-threshold-time", uint64(100*1000000)) // Increased to 100ms
+				// Increase buffer sizes for high frame rate (59.94 fps) and better negotiation
+				videoDemuxQueue.SetProperty("max-size-buffers", 500)                   // Increased significantly
+				videoDemuxQueue.SetProperty("max-size-time", uint64(1000*1000000))     // Increased to 1 second
+				videoDemuxQueue.SetProperty("min-threshold-time", uint64(200*1000000)) // Increased to 200ms
 				videoDemuxQueue.SetProperty("sync", false)                             // Disable sync for real-time
-				videoDemuxQueue.SetProperty("leaky", 2)                                // Leak downstream for better real-time performance
+				videoDemuxQueue.SetProperty("leaky", 0)                                // No leaking to ensure data integrity
+				videoDemuxQueue.SetProperty("max-size-bytes", 0)                       // No byte limit
 
 				// Create input capsfilter to ensure proper H.264 format before parsing
 				videoInputCapsfilter, err := gst.NewElementWithProperties("capsfilter", map[string]interface{}{
@@ -729,9 +750,8 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 					fmt.Printf("[%s] Failed to create video output capsfilter: %v\n", pipelineID, err)
 					return
 				}
-				// Set output caps for raw video - very flexible format to avoid conversion issues
-				// Use I420 format which is commonly supported by compositor
-				videoOutputCapsfilter.SetProperty("caps", gst.NewCapsFromString("video/x-raw,format=I420"))
+				// Set output caps for raw video - use more flexible format to avoid negotiation issues
+				videoOutputCapsfilter.SetProperty("caps", gst.NewCapsFromString("video/x-raw"))
 
 				// Create H.264 decoder for video with better configuration
 				videoDecoder, err := gst.NewElementWithProperties("avdec_h264", map[string]interface{}{
@@ -879,6 +899,7 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 				fmt.Printf("[%s] Successfully linked video pipeline: demux -> queue -> input_capsfilter -> h264parse -> parse_queue -> capsfilter -> decoder -> output_capsfilter -> intervideosink\n", pipelineID)
 				fmt.Printf("[%s] Video pipeline creation completed successfully\n", pipelineID)
 				fmt.Printf("[%s] Video should now be flowing to intervideosink channel 'input1'\n", pipelineID)
+				fmt.Printf("[%s] Video demux queue settings: max-buffers=500, max-time=1s, min-threshold=200ms, leaky=0\n", pipelineID)
 				// Mark RTP as connected if we haven't already
 				if !gp.rtpConnected {
 					gp.rtpConnected = true
@@ -897,12 +918,13 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 					fmt.Printf("[%s] Failed to create audio demux queue: %v\n", pipelineID, err)
 					return
 				}
-				// Better queue settings for audio
-				audioDemuxQueue.SetProperty("max-size-buffers", 100)                   // Increased from 50
-				audioDemuxQueue.SetProperty("max-size-time", uint64(300*1000000))      // Increased to 300ms
-				audioDemuxQueue.SetProperty("min-threshold-time", uint64(100*1000000)) // Increased to 100ms
+				// Better queue settings for audio continuity - prevent cutting
+				audioDemuxQueue.SetProperty("max-size-buffers", 300)                   // Increased significantly for audio continuity
+				audioDemuxQueue.SetProperty("max-size-time", uint64(1000*1000000))     // Increased to 1 second
+				audioDemuxQueue.SetProperty("min-threshold-time", uint64(200*1000000)) // Increased to 200ms
 				audioDemuxQueue.SetProperty("sync", false)                             // Disable sync for real-time
-				audioDemuxQueue.SetProperty("leaky", 2)                                // Leak downstream for better real-time performance
+				audioDemuxQueue.SetProperty("leaky", 0)                                // No leaking to ensure audio continuity
+				audioDemuxQueue.SetProperty("max-size-bytes", 0)                       // No byte limit
 
 				// Create aacparse for audio demux output with better configuration
 				audioAacparse, err := gst.NewElementWithProperties("aacparse", map[string]interface{}{
@@ -943,6 +965,7 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 					return
 				}
 				audioResample.SetProperty("sync", false) // Disable sync for real-time
+				audioResample.SetProperty("quality", 10) // Highest quality resampling
 
 				// Create audio capsfilter for format conversion
 				audioCapsfilter, err := gst.NewElementWithProperties("capsfilter", map[string]interface{}{
@@ -1051,6 +1074,8 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 				fmt.Printf("[%s] Successfully linked capsfilter to interaudiosink\n", pipelineID)
 
 				fmt.Printf("[%s] Successfully linked audio pipeline: demux -> queue -> aacparse -> decoder -> audioconvert -> audioresample -> capsfilter -> interaudiosink\n", pipelineID)
+				fmt.Printf("[%s] Audio demux queue settings: max-buffers=300, max-time=1s, min-threshold=200ms, leaky=0\n", pipelineID)
+				fmt.Printf("[%s] Audio resampler quality: 10 (highest)\n", pipelineID)
 				// Mark RTP as connected if we haven't already
 				if !gp.rtpConnected {
 					gp.rtpConnected = true
@@ -1137,7 +1162,7 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	// Assign elements to the pipeline instance
 	gp.demux = tsdemux
 	gp.mux = mpegtsmux
-	gp.compositor = compositor
+	gp.videomixer = videomixer
 	gp.audiomixer = audiomixer
 	// gp.pipeline.SetProperty("clock", gst.NewSystemClock())
 	fmt.Printf("[%s] Pipeline created successfully\n", pipelineID)
@@ -1220,7 +1245,7 @@ func (gp *GStreamerPipeline) createAssetPipeline() error {
 	return nil
 }
 
-// switchToAsset switches the compositor and audio mixer to show the asset video
+// switchToAsset switches the videomixer and audio mixer to show the asset video
 func (gp *GStreamerPipeline) switchToAsset() {
 	gp.mutex.Lock()
 	defer gp.mutex.Unlock()
@@ -1248,17 +1273,21 @@ func (gp *GStreamerPipeline) switchToAsset() {
 	gp.currentInput = "asset"
 	gp.assetPlaying = true
 
-	// Switch compositor to show asset (input2) with null checks
-	pad1 := gp.compositor.GetStaticPad("sink_0")
-	pad2 := gp.compositor.GetStaticPad("sink_1")
+	// Switch videomixer to show asset (input2) with null checks
+	pad1 := gp.videomixer.GetStaticPad("sink_0")
+	pad2 := gp.videomixer.GetStaticPad("sink_1")
 	if pad1 != nil && pad2 != nil {
 		pad1.SetProperty("alpha", 0.0) // Hide input1 (RTP stream)
 		pad2.SetProperty("alpha", 1.0) // Show input2 (asset)
-		fmt.Printf("[%s] Switched compositor to asset content\n", gp.pipelineID)
+		fmt.Printf("[%s] Switched videomixer to asset content\n", gp.pipelineID)
 	}
+
+	// Also set videomixer properties directly for better control
+	gp.videomixer.SetProperty("sink-pad-0::alpha", 0.0)
+	gp.videomixer.SetProperty("sink-pad-1::alpha", 1.0)
 }
 
-// switchToRTP switches the compositor and audio mixer back to the RTP stream
+// switchToRTP switches the videomixer and audio mixer back to the RTP stream
 func (gp *GStreamerPipeline) switchToRTP() {
 	gp.mutex.Lock()
 	defer gp.mutex.Unlock()
@@ -1303,14 +1332,18 @@ func (gp *GStreamerPipeline) switchToRTP() {
 		}
 	}()
 
-	// Switch compositor back to RTP stream (input1) with null checks
-	pad1 := gp.compositor.GetStaticPad("sink_0")
-	pad2 := gp.compositor.GetStaticPad("sink_1")
+	// Switch videomixer back to RTP stream (input1) with null checks
+	pad1 := gp.videomixer.GetStaticPad("sink_0")
+	pad2 := gp.videomixer.GetStaticPad("sink_1")
 	if pad1 != nil && pad2 != nil {
 		pad1.SetProperty("alpha", 1.0) // Show input1 (RTP stream)
 		pad2.SetProperty("alpha", 0.0) // Hide input2 (asset)
-		fmt.Printf("[%s] Switched compositor back to RTP content\n", gp.pipelineID)
+		fmt.Printf("[%s] Switched videomixer back to RTP content\n", gp.pipelineID)
 	}
+
+	// Also set videomixer properties directly for better control
+	gp.videomixer.SetProperty("sink-pad-0::alpha", 1.0)
+	gp.videomixer.SetProperty("sink-pad-1::alpha", 0.0)
 }
 
 // stopAsset stops the currently playing asset
@@ -1357,13 +1390,13 @@ func (gp *GStreamerPipeline) stopAsset() {
 		}
 	}()
 
-	// Switch compositor back to RTP stream (input1) with null checks
-	pad1 := gp.compositor.GetStaticPad("sink_0")
-	pad2 := gp.compositor.GetStaticPad("sink_1")
+	// Switch videomixer back to RTP stream (input1) with null checks
+	pad1 := gp.videomixer.GetStaticPad("sink_0")
+	pad2 := gp.videomixer.GetStaticPad("sink_1")
 	if pad1 != nil && pad2 != nil {
 		pad1.SetProperty("alpha", 1.0) // Show input1 (RTP stream)
 		pad2.SetProperty("alpha", 0.0) // Hide input2 (asset)
-		fmt.Printf("[%s] Switched compositor back to RTP content\n", gp.pipelineID)
+		fmt.Printf("[%s] Switched videomixer back to RTP content\n", gp.pipelineID)
 	}
 }
 
