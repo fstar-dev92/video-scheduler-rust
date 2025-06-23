@@ -345,7 +345,7 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 		return nil, fmt.Errorf("failed to create audioresample: %v", err)
 	}
 
-	voaacenc, err := gst.NewElementWithProperties("voaacenc", map[string]interface{}{
+	voaacenc, err := gst.NewElementWithProperties("avenc_aac", map[string]interface{}{
 		"name": fmt.Sprintf("voaacenc_%s", pipelineID),
 	})
 	if err != nil {
@@ -587,7 +587,7 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 
 			// Check pad name to determine if it's video or audio
 			if len(padName) >= 5 && padName[:5] == "video" {
-				fmt.Printf("[%s] Creating video pipeline: demux -> queue -> input_capsfilter -> h264parse -> capsfilter -> decoder -> videoconvert -> output_capsfilter -> intervideosink\n", pipelineID)
+				fmt.Printf("[%s] Creating video pipeline: demux -> queue -> input_capsfilter -> h264parse -> capsfilter -> decoder -> output_capsfilter -> intervideosink\n", pipelineID)
 
 				// Create queue for video demux output with better settings for high frame rate
 				videoDemuxQueue, err := gst.NewElementWithProperties("queue", map[string]interface{}{
@@ -650,17 +650,7 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 				}
 				videoDecoder.SetProperty("sync", false) // Disable sync for real-time
 
-				// Create videoconvert for format conversion
-				videoConvert, err := gst.NewElementWithProperties("videoconvert", map[string]interface{}{
-					"name": fmt.Sprintf("videoConvert_%s_%s", pipelineID, padName),
-				})
-				if err != nil {
-					fmt.Printf("[%s] Failed to create video convert: %v\n", pipelineID, err)
-					return
-				}
-				videoConvert.SetProperty("sync", false) // Disable sync for real-time
-
-				// Create output capsfilter for proper format
+				// Create output capsfilter for proper format - more flexible to handle actual video format
 				videoOutputCapsfilter, err := gst.NewElementWithProperties("capsfilter", map[string]interface{}{
 					"name": fmt.Sprintf("videoOutputCapsfilter_%s_%s", pipelineID, padName),
 				})
@@ -668,8 +658,8 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 					fmt.Printf("[%s] Failed to create video output capsfilter: %v\n", pipelineID, err)
 					return
 				}
-				// Set output caps for raw video
-				videoOutputCapsfilter.SetProperty("caps", gst.NewCapsFromString("video/x-raw,format=I420,width=1920,height=1080,framerate=60/1"))
+				// Set output caps for raw video - more flexible format
+				videoOutputCapsfilter.SetProperty("caps", gst.NewCapsFromString("video/x-raw,format=I420,width=1920,height=1080"))
 
 				// Add elements to pipeline
 				if err := gp.pipeline.Add(videoDemuxQueue); err != nil {
@@ -690,10 +680,6 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 				}
 				if err := gp.pipeline.Add(videoDecoder); err != nil {
 					fmt.Printf("[%s] Failed to add video decoder to pipeline: %v\n", pipelineID, err)
-					return
-				}
-				if err := gp.pipeline.Add(videoConvert); err != nil {
-					fmt.Printf("[%s] Failed to add video convert to pipeline: %v\n", pipelineID, err)
 					return
 				}
 				if err := gp.pipeline.Add(videoOutputCapsfilter); err != nil {
@@ -722,16 +708,12 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 					fmt.Printf("[%s] Failed to set video decoder state: %v\n", pipelineID, err)
 					return
 				}
-				if err := videoConvert.SetState(gst.StatePlaying); err != nil {
-					fmt.Printf("[%s] Failed to set video convert state: %v\n", pipelineID, err)
-					return
-				}
 				if err := videoOutputCapsfilter.SetState(gst.StatePlaying); err != nil {
 					fmt.Printf("[%s] Failed to set video output capsfilter state: %v\n", pipelineID, err)
 					return
 				}
 
-				// Link the chain: demux -> queue -> h264parse -> capsfilter -> decoder -> videoconvert -> output_capsfilter -> intervideosink
+				// Link the chain: demux -> queue -> input_capsfilter -> h264parse -> capsfilter -> decoder -> output_capsfilter -> intervideosink
 				if pad.Link(videoDemuxQueue.GetStaticPad("sink")) != gst.PadLinkOK {
 					fmt.Printf("[%s] Failed to link video pad to queue\n", pipelineID)
 					return
@@ -762,17 +744,11 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 				}
 				fmt.Printf("[%s] Successfully linked capsfilter to decoder\n", pipelineID)
 
-				if videoDecoder.GetStaticPad("src").Link(videoConvert.GetStaticPad("sink")) != gst.PadLinkOK {
-					fmt.Printf("[%s] Failed to link decoder to videoconvert\n", pipelineID)
+				if videoDecoder.GetStaticPad("src").Link(videoOutputCapsfilter.GetStaticPad("sink")) != gst.PadLinkOK {
+					fmt.Printf("[%s] Failed to link decoder to output capsfilter\n", pipelineID)
 					return
 				}
-				fmt.Printf("[%s] Successfully linked decoder to videoconvert\n", pipelineID)
-
-				if videoConvert.GetStaticPad("src").Link(videoOutputCapsfilter.GetStaticPad("sink")) != gst.PadLinkOK {
-					fmt.Printf("[%s] Failed to link videoconvert to output capsfilter\n", pipelineID)
-					return
-				}
-				fmt.Printf("[%s] Successfully linked videoconvert to output capsfilter\n", pipelineID)
+				fmt.Printf("[%s] Successfully linked decoder to output capsfilter\n", pipelineID)
 
 				if videoOutputCapsfilter.GetStaticPad("src").Link(intervideosink1.GetStaticPad("sink")) != gst.PadLinkOK {
 					fmt.Printf("[%s] Failed to link output capsfilter to intervideosink\n", pipelineID)
@@ -780,7 +756,7 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 				}
 				fmt.Printf("[%s] Successfully linked output capsfilter to intervideosink\n", pipelineID)
 
-				fmt.Printf("[%s] Successfully linked video pipeline: demux -> queue -> input_capsfilter -> h264parse -> capsfilter -> decoder -> videoconvert -> output_capsfilter -> intervideosink\n", pipelineID)
+				fmt.Printf("[%s] Successfully linked video pipeline: demux -> queue -> input_capsfilter -> h264parse -> capsfilter -> decoder -> output_capsfilter -> intervideosink\n", pipelineID)
 				// Mark RTP as connected if we haven't already
 				if !gp.rtpConnected {
 					gp.rtpConnected = true
