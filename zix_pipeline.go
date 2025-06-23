@@ -381,13 +381,6 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 		return nil, fmt.Errorf("failed to create mpegtsmux: %v", err)
 	}
 
-	rtpmp2tpay, err := gst.NewElementWithProperties("rtpmp2tpay", map[string]interface{}{
-		"name": fmt.Sprintf("rtpmp2tpay_%s", pipelineID),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create rtpmp2tpay: %v", err)
-	}
-
 	udpsink, err := gst.NewElementWithProperties("udpsink", map[string]interface{}{
 		"host":           outputHost,
 		"port":           outputPort,
@@ -446,10 +439,6 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	mpegtsmux.SetProperty("sync", false)                      // Disable sync for real-time
 	mpegtsmux.SetProperty("dts-method", 0)                    // Use default DTS method
 
-	rtpmp2tpay.SetProperty("mtu", 1400)
-	rtpmp2tpay.SetProperty("pt", 33)
-	rtpmp2tpay.SetProperty("perfect-rtptime", true)
-
 	// Add elements to pipeline
 	elements := []*gst.Element{
 		udpsrc, udpCapsfilter, rtpmp2tdepay, tsdemux,
@@ -458,7 +447,7 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 		interaudio1, interaudio2, audiomixer,
 		videoQueue1, videoQueue2, videoconvert, x264enc, h264parse2, videoMuxerQueue,
 		audioQueue1, audioQueue2, aacparse1, audioconvert, audioresample, voaacenc, aacparse2,
-		audioMuxerQueue, mpegtsmux, rtpmp2tpay, udpsink,
+		audioMuxerQueue, mpegtsmux, udpsink,
 	}
 
 	for _, element := range elements {
@@ -546,12 +535,8 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	}
 
 	// Link output branch
-	if err := mpegtsmux.Link(rtpmp2tpay); err != nil {
-		return nil, fmt.Errorf("failed to link mpegtsmux to rtpmp2tpay: %v", err)
-	}
-
-	if err := rtpmp2tpay.Link(udpsink); err != nil {
-		return nil, fmt.Errorf("failed to link rtpmp2tpay to udpsink: %v", err)
+	if err := mpegtsmux.Link(udpsink); err != nil {
+		return nil, fmt.Errorf("failed to link mpegtsmux to udpsink: %v", err)
 	}
 
 	// Set up dynamic pad-added signal for tsdemux with safer error handling
