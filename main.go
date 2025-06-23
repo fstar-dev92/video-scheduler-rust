@@ -43,7 +43,7 @@ func main() {
 	go func() {
 		err := RunGStreamerPipeline(*inputHost, *inputPort, *outputHost, *outputPort, *assetPath)
 		if err != nil {
-			log.Fatalf("Pipeline error: %v", err)
+			fmt.Printf("Pipeline error: %v", err)
 		}
 	}()
 

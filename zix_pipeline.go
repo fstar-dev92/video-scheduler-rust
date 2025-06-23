@@ -6,6 +6,7 @@ import (
 	"os"
 	"runtime"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"time"
 
@@ -78,17 +79,23 @@ type GStreamerPipeline struct {
 	assetPlaying   bool
 	stopChan       chan struct{}
 	running        bool
+	rtpConnected   bool        // Track if RTP stream is connected
+	rtpTimeout     *time.Timer // Timeout for RTP connection
+	pipelineID     string      // Add this field
 }
 
 // NewGStreamerPipeline creates a new GStreamer pipeline for RTP processing with compositor and audio mixer
 func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, outputPort int, assetVideoPath string) (*GStreamerPipeline, error) {
-	// Create pipeline
-	pipeline, err := gst.NewPipeline("rtp-pipeline")
+	// Generate a unique pipeline ID (you could also accept this as a parameter)
+	pipelineID := fmt.Sprintf("pipeline_%d", time.Now().UnixNano())
+
+	// Create pipeline with unique name
+	pipeline, err := gst.NewPipeline(fmt.Sprintf("rtp-pipeline-%s", pipelineID))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create pipeline: %v", err)
 	}
 
-	// Create the pipeline instance first so we can reference it in signal handlers
+	// Create the pipeline instance
 	gp := &GStreamerPipeline{
 		pipeline:       pipeline,
 		assetVideoPath: assetVideoPath,
@@ -96,30 +103,38 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 		assetPlaying:   false,
 		stopChan:       make(chan struct{}),
 		running:        false,
+		rtpConnected:   false,
+		rtpTimeout:     time.NewTimer(30 * time.Second),
+		pipelineID:     pipelineID, // Set the pipeline ID
 	}
 
-	// Create elements with proper error handling
-	udpsrc, err := gst.NewElement("udpsrc")
+	// Create elements with unique names
+	udpsrc, err := gst.NewElementWithProperties("udpsrc", map[string]interface{}{
+		"name": fmt.Sprintf("udpsrc_%s", pipelineID),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create udpsrc: %v", err)
 	}
 
-	rtpjitterbuffer, err := gst.NewElement("rtpjitterbuffer")
+	rtpjitterbuffer, err := gst.NewElementWithProperties("rtpjitterbuffer", map[string]interface{}{
+		"name": fmt.Sprintf("rtpjitterbuffer_%s", pipelineID),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create rtpjitterbuffer: %v", err)
 	}
 
-	rtpmp2tdepay, err := gst.NewElement("rtpmp2tdepay")
+	rtpmp2tdepay, err := gst.NewElementWithProperties("rtpmp2tdepay", map[string]interface{}{
+		"name": fmt.Sprintf("rtpmp2tdepay_%s", pipelineID),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create rtpmp2tdepay: %v", err)
 	}
 
 	tsdemux, err := gst.NewElementWithProperties("tsdemux", map[string]interface{}{
-		"name":               "tsdemux",
-		"send-scte35-events": true, // Enable SCTE-35Parse
+		"name":               fmt.Sprintf("tsdemux_%s", pipelineID),
+		"send-scte35-events": true,
 		"latency":            1000,
 	})
-
 	if err != nil {
 		return nil, fmt.Errorf("failed to create tsdemux: %v", err)
 	}
@@ -127,10 +142,10 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	// Create intervideosink for RTP stream (input1)
 	intervideosink1, err := gst.NewElementWithProperties("intervideosink", map[string]interface{}{
 		"channel":      "input1",
-		"sync":         true,
-		"name":         "intervideosink1",
-		"max-lateness": int64(20 * 1000000), // 20ms max lateness
-		"qos":          true,                // Enable QoS
+		"sync":         false,
+		"name":         fmt.Sprintf("intervideosink1_%s", pipelineID),
+		"max-lateness": int64(20 * 1000000),
+		"qos":          true,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create intervideosink1: %v", err)
@@ -139,10 +154,10 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	// Create interaudiosink for RTP stream (audio1)
 	interaudiosink1, err := gst.NewElementWithProperties("interaudiosink", map[string]interface{}{
 		"channel":      "audio1",
-		"sync":         true,
-		"name":         "interaudiosink1",
-		"max-lateness": int64(20 * 1000000), // 20ms max lateness
-		"qos":          true,                // Enable QoS
+		"sync":         false,
+		"name":         fmt.Sprintf("interaudiosink1_%s", pipelineID),
+		"max-lateness": int64(20 * 1000000),
+		"qos":          true,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create interaudiosink1: %v", err)
@@ -152,8 +167,7 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	intervideo1, err := gst.NewElementWithProperties("intervideosrc", map[string]interface{}{
 		"channel":      "input1",
 		"do-timestamp": true,
-		"name":         "intervideosrc1",
-		"is-live":      true,
+		"name":         fmt.Sprintf("intervideosrc1_%s", pipelineID),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create intervideosrc1: %v", err)
@@ -163,8 +177,7 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	intervideo2, err := gst.NewElementWithProperties("intervideosrc", map[string]interface{}{
 		"channel":      "input2",
 		"do-timestamp": true,
-		"name":         "intervideosrc2",
-		"is-live":      true,
+		"name":         fmt.Sprintf("intervideosrc2_%s", pipelineID),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create intervideosrc2: %v", err)
@@ -174,8 +187,7 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	interaudio1, err := gst.NewElementWithProperties("interaudiosrc", map[string]interface{}{
 		"channel":      "audio1",
 		"do-timestamp": true,
-		"name":         "interaudiosrc1",
-		"is-live":      true,
+		"name":         fmt.Sprintf("interaudiosrc1_%s", pipelineID),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create interaudiosrc1: %v", err)
@@ -185,8 +197,7 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	interaudio2, err := gst.NewElementWithProperties("interaudiosrc", map[string]interface{}{
 		"channel":      "audio2",
 		"do-timestamp": true,
-		"name":         "interaudiosrc2",
-		"is-live":      true,
+		"name":         fmt.Sprintf("interaudiosrc2_%s", pipelineID),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create interaudiosrc2: %v", err)
@@ -194,9 +205,9 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 
 	// Create video mixer (compositor)
 	compositor, err := gst.NewElementWithProperties("compositor", map[string]interface{}{
-		"background":            1, // black background
+		"background":            1,
 		"zero-size-is-unscaled": true,
-		"name":                  "compositor",
+		"name":                  fmt.Sprintf("compositor_%s", pipelineID),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create compositor: %v", err)
@@ -222,114 +233,137 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	}
 
 	// Create audio mixer
-	audiomixer, err := gst.NewElement("audiomixer")
+	audiomixer, err := gst.NewElementWithProperties("audiomixer", map[string]interface{}{
+		"name": fmt.Sprintf("audiomixer_%s", pipelineID),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create audiomixer: %v", err)
 	}
-	audiomixer.SetProperty("name", "audiomixer")
 
 	// Create video processing elements for RTP stream (input1)
-	videoQueue1, err := gst.NewElement("queue")
+	videoQueue1, err := gst.NewElementWithProperties("queue", map[string]interface{}{
+		"name": fmt.Sprintf("videoQueue1_%s", pipelineID),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create video queue 1: %v", err)
 	}
 	videoQueue1.SetProperty("max-size-buffers", 100)
-	videoQueue1.SetProperty("max-size-time", uint64(500*1000000))     // 500ms
-	videoQueue1.SetProperty("min-threshold-time", uint64(50*1000000)) // 50ms
+	videoQueue1.SetProperty("max-size-time", uint64(500*1000000))
+	videoQueue1.SetProperty("min-threshold-time", uint64(50*1000000))
 
 	// Create video processing elements for asset stream (input2)
-	videoQueue2, err := gst.NewElement("queue")
+	videoQueue2, err := gst.NewElementWithProperties("queue", map[string]interface{}{
+		"name": fmt.Sprintf("videoQueue2_%s", pipelineID),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create video queue 2: %v", err)
 	}
 	videoQueue2.SetProperty("max-size-buffers", 100)
-	videoQueue2.SetProperty("max-size-time", uint64(500*1000000))     // 500ms
-	videoQueue2.SetProperty("min-threshold-time", uint64(50*1000000)) // 50ms
+	videoQueue2.SetProperty("max-size-time", uint64(500*1000000))
+	videoQueue2.SetProperty("min-threshold-time", uint64(50*1000000))
 
 	// Create video processing chain elements
-	videoconvert, err := gst.NewElement("videoconvert")
+	videoconvert, err := gst.NewElementWithProperties("videoconvert", map[string]interface{}{
+		"name": fmt.Sprintf("videoconvert_%s", pipelineID),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create videoconvert: %v", err)
 	}
 
-	x264enc, err := gst.NewElement("x264enc")
+	x264enc, err := gst.NewElementWithProperties("x264enc", map[string]interface{}{
+		"name": fmt.Sprintf("x264enc_%s", pipelineID),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create x264enc: %v", err)
 	}
 
-	h264parse2, err := gst.NewElement("h264parse")
+	h264parse2, err := gst.NewElementWithProperties("h264parse", map[string]interface{}{
+		"name": fmt.Sprintf("h264parse2_%s", pipelineID),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create h264parse2: %v", err)
 	}
 
 	// Create audio processing elements for RTP stream (audio1)
-	audioQueue1, err := gst.NewElement("queue")
+	audioQueue1, err := gst.NewElementWithProperties("queue", map[string]interface{}{
+		"name": fmt.Sprintf("audioQueue1_%s", pipelineID),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create audio queue 1: %v", err)
 	}
 	audioQueue1.SetProperty("max-size-buffers", 100)
-	audioQueue1.SetProperty("max-size-time", uint64(500*1000000))     // 500ms
-	audioQueue1.SetProperty("min-threshold-time", uint64(50*1000000)) // 50ms
+	audioQueue1.SetProperty("max-size-time", uint64(500*1000000))
+	audioQueue1.SetProperty("min-threshold-time", uint64(50*1000000))
 
 	// Create audio processing elements for asset stream (audio2)
-	audioQueue2, err := gst.NewElement("queue")
+	audioQueue2, err := gst.NewElementWithProperties("queue", map[string]interface{}{
+		"name": fmt.Sprintf("audioQueue2_%s", pipelineID),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create audio queue 2: %v", err)
 	}
 	audioQueue2.SetProperty("max-size-buffers", 100)
-	audioQueue2.SetProperty("max-size-time", uint64(500*1000000))     // 500ms
-	audioQueue2.SetProperty("min-threshold-time", uint64(50*1000000)) // 50ms
+	audioQueue2.SetProperty("max-size-time", uint64(500*1000000))
+	audioQueue2.SetProperty("min-threshold-time", uint64(50*1000000))
 
 	// Create audio processing chain elements
-	aacparse1, err := gst.NewElement("aacparse")
+	aacparse1, err := gst.NewElementWithProperties("aacparse", map[string]interface{}{
+		"name": fmt.Sprintf("aacparse1_%s", pipelineID),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create aacparse1: %v", err)
 	}
 
-	audioconvert, err := gst.NewElement("audioconvert")
+	audioconvert, err := gst.NewElementWithProperties("audioconvert", map[string]interface{}{
+		"name": fmt.Sprintf("audioconvert_%s", pipelineID),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create audioconvert: %v", err)
 	}
 
-	// Add audio resampler for better compatibility
-	audioresample, err := gst.NewElement("audioresample")
+	audioresample, err := gst.NewElementWithProperties("audioresample", map[string]interface{}{
+		"name": fmt.Sprintf("audioresample_%s", pipelineID),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create audioresample: %v", err)
 	}
 
-	voaacenc, err := gst.NewElement("voaacenc")
+	voaacenc, err := gst.NewElementWithProperties("voaacenc", map[string]interface{}{
+		"name": fmt.Sprintf("voaacenc_%s", pipelineID),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create voaacenc: %v", err)
 	}
 
-	aacparse2, err := gst.NewElement("aacparse")
+	aacparse2, err := gst.NewElementWithProperties("aacparse", map[string]interface{}{
+		"name": fmt.Sprintf("aacparse2_%s", pipelineID),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create aacparse2: %v", err)
 	}
 
 	// Audio queue before muxer
-	audioMuxerQueue, err := gst.NewElement("queue")
+	audioMuxerQueue, err := gst.NewElementWithProperties("queue", map[string]interface{}{
+		"name": fmt.Sprintf("audioMuxerQueue_%s", pipelineID),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create audio muxer queue: %v", err)
 	}
 	audioMuxerQueue.SetProperty("max-size-buffers", 50)
-	audioMuxerQueue.SetProperty("max-size-time", uint64(200*1000000))     // 200ms
-	audioMuxerQueue.SetProperty("min-threshold-time", uint64(50*1000000)) // 50ms
+	audioMuxerQueue.SetProperty("max-size-time", uint64(200*1000000))
+	audioMuxerQueue.SetProperty("min-threshold-time", uint64(50*1000000))
 
 	// Muxer and output elements
-	mpegtsmux, err := gst.NewElement("mpegtsmux")
+	mpegtsmux, err := gst.NewElementWithProperties("mpegtsmux", map[string]interface{}{
+		"name": fmt.Sprintf("mpegtsmux_%s", pipelineID),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create mpegtsmux: %v", err)
 	}
 
-	// Configure MPEG-TS muxer for better compatibility
-	mpegtsmux.SetProperty("alignment", 7)
-	mpegtsmux.SetProperty("pat-interval", int64(100*1000000)) // 100ms
-	mpegtsmux.SetProperty("pmt-interval", int64(100*1000000)) // 100ms
-	mpegtsmux.SetProperty("pcr-interval", int64(20*1000000))  // 20ms
-	mpegtsmux.SetProperty("muxrate", 10080000)                // 10.08 Mbps
-
-	rtpmp2tpay, err := gst.NewElement("rtpmp2tpay")
+	rtpmp2tpay, err := gst.NewElementWithProperties("rtpmp2tpay", map[string]interface{}{
+		"name": fmt.Sprintf("rtpmp2tpay_%s", pipelineID),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create rtpmp2tpay: %v", err)
 	}
@@ -337,10 +371,10 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	udpsink, err := gst.NewElementWithProperties("udpsink", map[string]interface{}{
 		"host":           outputHost,
 		"port":           outputPort,
-		"sync":           true,
+		"sync":           false,
 		"buffer-size":    524288,
 		"auto-multicast": true,
-		"name":           "udpsink",
+		"name":           fmt.Sprintf("udpsink_%s", pipelineID),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create udpsink: %v", err)
@@ -478,8 +512,7 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 
 	// Set up dynamic pad-added signal for tsdemux with safer error handling
 	tsdemux.Connect("pad-added", func(self *gst.Element, pad *gst.Pad) {
-
-		fmt.Printf("##############################################\n")
+		fmt.Printf("[%s] ##############################################\n", pipelineID)
 		// Use a goroutine to handle the pad addition asynchronously to avoid blocking the signal
 		go func() {
 			// Add a small delay to ensure the pad is fully created
@@ -491,44 +524,56 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 
 			// Check if pipeline is still running
 			if !gp.running {
-				fmt.Printf("Pipeline is not running, ignoring pad addition\n")
+				fmt.Printf("[%s] Pipeline is not running, ignoring pad addition\n", pipelineID)
 				return
 			}
 
 			if pad == nil {
-				fmt.Printf("Warning: Received nil pad in pad-added signal\n")
+				fmt.Printf("[%s] Warning: Received nil pad in pad-added signal\n", pipelineID)
 				return
 			}
 
 			padName := pad.GetName()
 			if padName == "" {
-				fmt.Printf("Warning: Received pad with empty name\n")
+				fmt.Printf("[%s] Warning: Received pad with empty name\n", pipelineID)
 				return
 			}
 
-			fmt.Printf("Demuxer pad added: %s\n", padName)
+			fmt.Printf("[%s] Demuxer pad added: %s\n", pipelineID, padName)
 
 			// Check pad name to determine if it's video or audio
 			if len(padName) >= 5 && padName[:5] == "video" {
-				fmt.Printf("Linking video pad %s to intervideosink1\n", padName)
+				fmt.Printf("[%s] Linking video pad %s to intervideosink1\n", pipelineID, padName)
 				// Link video pad directly to intervideosink like in scte35_handler.go
 				result := pad.Link(intervideosink1.GetStaticPad("sink"))
 				if result != gst.PadLinkOK {
-					fmt.Printf("Failed to link video pad: %v\n", result)
+					fmt.Printf("[%s] Failed to link video pad: %v\n", pipelineID, result)
 				} else {
-					fmt.Printf("Successfully linked video pad to intervideosink\n")
+					fmt.Printf("[%s] Successfully linked video pad to intervideosink\n", pipelineID)
+					// Mark RTP as connected if we haven't already
+					if !gp.rtpConnected {
+						gp.rtpConnected = true
+						gp.rtpTimeout.Stop() // Stop the timeout timer
+						fmt.Printf("[%s] RTP stream connected successfully\n", pipelineID)
+					}
 				}
 			} else if len(padName) >= 5 && padName[:5] == "audio" {
-				fmt.Printf("Linking audio pad %s to interaudiosink1\n", padName)
+				fmt.Printf("[%s] Linking audio pad %s to interaudiosink1\n", pipelineID, padName)
 				// Link audio pad directly to interaudiosink like in scte35_handler.go
 				result := pad.Link(interaudiosink1.GetStaticPad("sink"))
 				if result != gst.PadLinkOK {
-					fmt.Printf("Failed to link audio pad: %v\n", result)
+					fmt.Printf("[%s] Failed to link audio pad: %v\n", pipelineID, result)
 				} else {
-					fmt.Printf("Successfully linked audio pad to interaudiosink\n")
+					fmt.Printf("[%s] Successfully linked audio pad to interaudiosink\n", pipelineID)
+					// Mark RTP as connected if we haven't already
+					if !gp.rtpConnected {
+						gp.rtpConnected = true
+						gp.rtpTimeout.Stop() // Stop the timeout timer
+						fmt.Printf("[%s] RTP stream connected successfully\n", pipelineID)
+					}
 				}
 			} else {
-				fmt.Printf("Unknown demuxer pad: %s\n", padName)
+				fmt.Printf("[%s] Unknown demuxer pad: %s\n", pipelineID, padName)
 			}
 		}()
 	})
@@ -545,18 +590,50 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 			switch msg.Type() {
 			case gst.MessageStateChanged:
 				oldState, newState := msg.ParseStateChanged()
-				fmt.Printf("Pipeline state changed: %s -> %s\n", oldState.String(), newState.String())
+				fmt.Printf("[%s] Pipeline state changed: %s -> %s\n", pipelineID, oldState.String(), newState.String())
+
+				// If pipeline fails to go to PLAYING state, it might be due to no RTP data
+				if newState == gst.StatePaused && oldState == gst.StateReady {
+					fmt.Printf("[%s] Pipeline stuck in PAUSED state - likely no RTP data received\n", pipelineID)
+					// Give it a bit more time, then switch to asset if still no RTP
+					go func() {
+						time.Sleep(5 * time.Second)
+						if gp.running && !gp.rtpConnected {
+							fmt.Printf("[%s] Pipeline still not receiving RTP data, switching to asset\n", pipelineID)
+							gp.switchToAsset()
+						}
+					}()
+				}
+
+				// If pipeline goes from PLAYING to PAUSED, it might be due to no RTP data
+				if newState == gst.StatePaused && oldState == gst.StatePlaying {
+					fmt.Printf("[%s] Pipeline went from PLAYING to PAUSED - checking for RTP data issues\n", pipelineID)
+					go func() {
+						time.Sleep(2 * time.Second)
+						if gp.running && !gp.rtpConnected {
+							fmt.Printf("[%s] Pipeline paused due to no RTP data, switching to asset\n", pipelineID)
+							gp.switchToAsset()
+						}
+					}()
+				}
 			case gst.MessageError:
 				gerr := msg.ParseError()
-				fmt.Printf("Pipeline error: %s\n", gerr.Error())
+				fmt.Printf("[%s] Pipeline error: %s\n", pipelineID, gerr.Error())
+
+				// Check if error is related to missing RTP data
+				errorMsg := gerr.Error()
+				if !gp.rtpConnected && (strings.Contains(errorMsg, "no pads") || strings.Contains(errorMsg, "not linked") || strings.Contains(errorMsg, "streaming")) {
+					fmt.Printf("[%s] Pipeline error likely due to no RTP data - switching to asset\n", pipelineID)
+					gp.switchToAsset()
+				}
 			case gst.MessageWarning:
 				gwarn := msg.ParseWarning()
-				fmt.Printf("Pipeline warning: %s\n", gwarn.Error())
+				fmt.Printf("[%s] Pipeline warning: %s\n", pipelineID, gwarn.Error())
 			case gst.MessageInfo:
 				ginfo := msg.ParseInfo()
-				fmt.Printf("Pipeline info: %s\n", ginfo.Error())
+				fmt.Printf("[%s] Pipeline info: %s\n", pipelineID, ginfo.Error())
 			case gst.MessageEOS:
-				fmt.Printf("Pipeline reached end of stream\n")
+				fmt.Printf("[%s] Pipeline reached end of stream\n", pipelineID)
 			}
 		}
 	}()
@@ -566,20 +643,22 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	gp.mux = mpegtsmux
 	gp.compositor = compositor
 	gp.audiomixer = audiomixer
-
+	// gp.pipeline.SetProperty("clock", gst.NewSystemClock())
+	fmt.Printf("[%s] Pipeline created successfully\n", pipelineID)
 	return gp, nil
 }
 
 // createAssetPipeline creates a pipeline for playing the local asset video file
 func (gp *GStreamerPipeline) createAssetPipeline() error {
-	pipeline, err := gst.NewPipeline("asset-pipeline")
+	pipeline, err := gst.NewPipeline(fmt.Sprintf("asset-pipeline-%s", gp.pipelineID))
 	if err != nil {
 		return fmt.Errorf("failed to create asset pipeline: %v", err)
 	}
 
 	// Create playbin for asset file
 	playbin, err := gst.NewElementWithProperties("playbin3", map[string]interface{}{
-		"uri": fmt.Sprintf("file://%s", gp.assetVideoPath),
+		"uri":  fmt.Sprintf("file://%s", gp.assetVideoPath),
+		"name": fmt.Sprintf("playbin_%s", gp.pipelineID),
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create playbin: %v", err)
@@ -588,7 +667,8 @@ func (gp *GStreamerPipeline) createAssetPipeline() error {
 	// Create video sink
 	intervideosink, err := gst.NewElementWithProperties("intervideosink", map[string]interface{}{
 		"channel": "input2",
-		"sync":    true,
+		"sync":    false,
+		"name":    fmt.Sprintf("asset_intervideosink_%s", gp.pipelineID),
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create intervideosink: %v", err)
@@ -597,7 +677,8 @@ func (gp *GStreamerPipeline) createAssetPipeline() error {
 	// Create audio sink
 	interaudiosink, err := gst.NewElementWithProperties("interaudiosink", map[string]interface{}{
 		"channel": "audio2",
-		"sync":    true,
+		"sync":    false,
+		"name":    fmt.Sprintf("asset_interaudiosink_%s", gp.pipelineID),
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create interaudiosink: %v", err)
@@ -625,19 +706,20 @@ func (gp *GStreamerPipeline) createAssetPipeline() error {
 			case gst.MessageStateChanged:
 				oldState, newState := msg.ParseStateChanged()
 				if newState == gst.StatePlaying && oldState != gst.StatePaused {
-					fmt.Printf("Asset pipeline is now PLAYING\n")
+					fmt.Printf("[%s] Asset pipeline is now PLAYING\n", gp.pipelineID)
 				}
 			case gst.MessageError:
 				gerr := msg.ParseError()
-				fmt.Printf("Asset pipeline error: %s\n", gerr.Error())
+				fmt.Printf("[%s] Asset pipeline error: %s\n", gp.pipelineID, gerr.Error())
 				gp.stopAsset()
 			case gst.MessageEOS:
-				fmt.Printf("Asset finished, switching back to RTP\n")
+				fmt.Printf("[%s] Asset finished, switching back to RTP\n", gp.pipelineID)
 				gp.switchToRTP()
 			}
 		}
 	}()
 
+	fmt.Printf("[%s] Asset pipeline created successfully\n", gp.pipelineID)
 	gp.assetPipeline = pipeline
 	return nil
 }
@@ -648,22 +730,22 @@ func (gp *GStreamerPipeline) switchToAsset() {
 	defer gp.mutex.Unlock()
 
 	if gp.currentInput == "asset" {
-		fmt.Printf("Already playing asset, ignoring switch request\n")
+		fmt.Printf("[%s] Already playing asset, ignoring switch request\n", gp.pipelineID)
 		return
 	}
 
-	fmt.Printf("Switching to asset video: %s\n", gp.assetVideoPath)
+	fmt.Printf("[%s] Switching to asset video: %s\n", gp.pipelineID, gp.assetVideoPath)
 
 	// Create and start asset pipeline
 	err := gp.createAssetPipeline()
 	if err != nil {
-		fmt.Printf("Failed to create asset pipeline: %v\n", err)
+		fmt.Printf("[%s] Failed to create asset pipeline: %v\n", gp.pipelineID, err)
 		return
 	}
 
 	// Set asset pipeline to PLAYING
 	if err := gp.assetPipeline.SetState(gst.StatePlaying); err != nil {
-		fmt.Printf("Failed to set asset pipeline state: %v\n", err)
+		fmt.Printf("[%s] Failed to set asset pipeline state: %v\n", gp.pipelineID, err)
 		return
 	}
 
@@ -676,7 +758,7 @@ func (gp *GStreamerPipeline) switchToAsset() {
 	if pad1 != nil && pad2 != nil {
 		pad1.SetProperty("alpha", 0.0) // Hide input1 (RTP stream)
 		pad2.SetProperty("alpha", 1.0) // Show input2 (asset)
-		fmt.Printf("Switched compositor to asset content\n")
+		fmt.Printf("[%s] Switched compositor to asset content\n", gp.pipelineID)
 	}
 }
 
@@ -686,16 +768,16 @@ func (gp *GStreamerPipeline) switchToRTP() {
 	defer gp.mutex.Unlock()
 
 	if gp.currentInput == "rtp" {
-		fmt.Printf("Already playing RTP, ignoring switch request\n")
+		fmt.Printf("[%s] Already playing RTP, ignoring switch request\n", gp.pipelineID)
 		return
 	}
 
-	fmt.Printf("Switching back to RTP stream\n")
+	fmt.Printf("[%s] Switching back to RTP stream\n", gp.pipelineID)
 
 	// Stop asset pipeline
 	if gp.assetPipeline != nil {
 		if err := gp.assetPipeline.SetState(gst.StateNull); err != nil {
-			fmt.Printf("Failed to stop asset pipeline: %v\n", err)
+			fmt.Printf("[%s] Failed to stop asset pipeline: %v\n", gp.pipelineID, err)
 		}
 		gp.assetPipeline = nil
 	}
@@ -703,13 +785,35 @@ func (gp *GStreamerPipeline) switchToRTP() {
 	gp.currentInput = "rtp"
 	gp.assetPlaying = false
 
+	// Reset RTP connection status and restart timeout
+	gp.rtpConnected = false
+	if gp.rtpTimeout != nil {
+		gp.rtpTimeout.Stop()
+	}
+	gp.rtpTimeout = time.NewTimer(30 * time.Second)
+
+	// Start monitoring for RTP timeout again
+	go func() {
+		select {
+		case <-gp.rtpTimeout.C:
+			if gp.running && !gp.rtpConnected {
+				fmt.Printf("[%s] RTP connection timeout after switch back - no packets received within 30 seconds\n", gp.pipelineID)
+				fmt.Printf("[%s] Switching to asset video due to RTP timeout\n", gp.pipelineID)
+				gp.switchToAsset()
+			}
+		case <-gp.stopChan:
+			gp.rtpTimeout.Stop()
+			return
+		}
+	}()
+
 	// Switch compositor back to RTP stream (input1) with null checks
 	pad1 := gp.compositor.GetStaticPad("sink_0")
 	pad2 := gp.compositor.GetStaticPad("sink_1")
 	if pad1 != nil && pad2 != nil {
 		pad1.SetProperty("alpha", 1.0) // Show input1 (RTP stream)
 		pad2.SetProperty("alpha", 0.0) // Hide input2 (asset)
-		fmt.Printf("Switched compositor back to RTP content\n")
+		fmt.Printf("[%s] Switched compositor back to RTP content\n", gp.pipelineID)
 	}
 }
 
@@ -722,12 +826,12 @@ func (gp *GStreamerPipeline) stopAsset() {
 		return
 	}
 
-	fmt.Printf("Stopping asset playback\n")
+	fmt.Printf("[%s] Stopping asset playback\n", gp.pipelineID)
 
 	// Stop asset pipeline
 	if gp.assetPipeline != nil {
 		if err := gp.assetPipeline.SetState(gst.StateNull); err != nil {
-			fmt.Printf("Failed to stop asset pipeline: %v\n", err)
+			fmt.Printf("[%s] Failed to stop asset pipeline: %v\n", gp.pipelineID, err)
 		}
 		gp.assetPipeline = nil
 	}
@@ -735,13 +839,35 @@ func (gp *GStreamerPipeline) stopAsset() {
 	gp.assetPlaying = false
 	gp.currentInput = "rtp"
 
+	// Reset RTP connection status and restart timeout
+	gp.rtpConnected = false
+	if gp.rtpTimeout != nil {
+		gp.rtpTimeout.Stop()
+	}
+	gp.rtpTimeout = time.NewTimer(30 * time.Second)
+
+	// Start monitoring for RTP timeout again
+	go func() {
+		select {
+		case <-gp.rtpTimeout.C:
+			if gp.running && !gp.rtpConnected {
+				fmt.Printf("[%s] RTP connection timeout after asset stop - no packets received within 30 seconds\n", gp.pipelineID)
+				fmt.Printf("[%s] Switching to asset video due to RTP timeout\n", gp.pipelineID)
+				gp.switchToAsset()
+			}
+		case <-gp.stopChan:
+			gp.rtpTimeout.Stop()
+			return
+		}
+	}()
+
 	// Switch compositor back to RTP stream (input1) with null checks
 	pad1 := gp.compositor.GetStaticPad("sink_0")
 	pad2 := gp.compositor.GetStaticPad("sink_1")
 	if pad1 != nil && pad2 != nil {
 		pad1.SetProperty("alpha", 1.0) // Show input1 (RTP stream)
 		pad2.SetProperty("alpha", 0.0) // Hide input2 (asset)
-		fmt.Printf("Switched compositor back to RTP content\n")
+		fmt.Printf("[%s] Switched compositor back to RTP content\n", gp.pipelineID)
 	}
 }
 
@@ -753,13 +879,28 @@ func (gp *GStreamerPipeline) Start() error {
 	}
 
 	gp.running = true
-	fmt.Printf("GStreamer pipeline started successfully\n")
+	fmt.Printf("[%s] GStreamer pipeline started successfully\n", gp.pipelineID)
 
-	// Start a timer to switch to asset after 1 minute
+	// Start RTP timeout monitoring
+	go func() {
+		select {
+		case <-gp.rtpTimeout.C:
+			if gp.running && !gp.rtpConnected {
+				fmt.Printf("[%s] RTP connection timeout - no packets received within 30 seconds\n", gp.pipelineID)
+				fmt.Printf("[%s] Switching to asset video due to RTP timeout\n", gp.pipelineID)
+				gp.switchToAsset()
+			}
+		case <-gp.stopChan:
+			gp.rtpTimeout.Stop()
+			return
+		}
+	}()
+
+	// Start a timer to switch to asset after 1 minute (only if RTP is connected)
 	go func() {
 		time.Sleep(1 * time.Minute)
-		if gp.running {
-			fmt.Printf("1 minute elapsed, switching to asset video\n")
+		if gp.running && gp.rtpConnected {
+			fmt.Printf("[%s] 1 minute elapsed, switching to asset video\n", gp.pipelineID)
 			gp.switchToAsset()
 		}
 	}()
@@ -769,7 +910,7 @@ func (gp *GStreamerPipeline) Start() error {
 
 // Stop stops the GStreamer pipeline
 func (gp *GStreamerPipeline) Stop() {
-	fmt.Println("Stopping GStreamer pipeline...")
+	fmt.Println("[", gp.pipelineID, "] Stopping GStreamer pipeline...")
 
 	gp.mutex.Lock()
 	defer gp.mutex.Unlock()
@@ -777,10 +918,15 @@ func (gp *GStreamerPipeline) Stop() {
 	gp.running = false
 	close(gp.stopChan)
 
+	// Stop RTP timeout timer
+	if gp.rtpTimeout != nil {
+		gp.rtpTimeout.Stop()
+	}
+
 	// Stop asset pipeline if running
 	if gp.assetPipeline != nil {
 		if err := gp.assetPipeline.SetState(gst.StateNull); err != nil {
-			fmt.Printf("Failed to stop asset pipeline: %v\n", err)
+			fmt.Printf("[%s] Failed to stop asset pipeline: %v\n", gp.pipelineID, err)
 		}
 		gp.assetPipeline = nil
 	}
@@ -788,11 +934,11 @@ func (gp *GStreamerPipeline) Stop() {
 	// Set pipeline state to null
 	if gp.pipeline != nil {
 		if err := gp.pipeline.SetState(gst.StateNull); err != nil {
-			fmt.Printf("Failed to stop main pipeline: %v\n", err)
+			fmt.Printf("[%s] Failed to stop main pipeline: %v\n", gp.pipelineID, err)
 		}
 	}
 
-	fmt.Println("GStreamer pipeline stopped")
+	fmt.Println("[", gp.pipelineID, "] GStreamer pipeline stopped")
 }
 
 // RunGStreamerPipeline runs the GStreamer pipeline with the specified parameters
@@ -804,7 +950,6 @@ func RunGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	if err != nil {
 		return fmt.Errorf("failed to create pipeline: %v", err)
 	}
-
 	// Start pipeline
 	if err := pipeline.Start(); err != nil {
 		return fmt.Errorf("failed to start pipeline: %v", err)
