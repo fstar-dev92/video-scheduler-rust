@@ -71,6 +71,8 @@ type GStreamerPipeline struct {
 	mux            *gst.Element
 	videomixer     *gst.Element
 	audiomixer     *gst.Element
+	rtpVolume      *gst.Element // Volume control for RTP audio
+	assetVolume    *gst.Element // Volume control for asset audio
 	assetPipeline  *gst.Pipeline
 	mutex          sync.Mutex
 	padMutex       sync.Mutex // Mutex for protecting pad operations
@@ -290,6 +292,28 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	if err != nil {
 		return nil, fmt.Errorf("failed to create audiomixer: %v", err)
 	}
+	// Audio mixer settings for better synchronization and preventing cutting
+	audiomixer.SetProperty("latency", int64(100*1000000)) // 100ms latency for better sync
+	audiomixer.SetProperty("silent", false)               // Don't output silence when no input
+	audiomixer.SetProperty("resampler", "audioconvert")   // Use audioconvert for resampling
+
+	// Create volume control for RTP audio (input1)
+	rtpVolume, err := gst.NewElementWithProperties("volume", map[string]interface{}{
+		"name": fmt.Sprintf("rtpVolume_%s", pipelineID),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create RTP volume control: %v", err)
+	}
+	rtpVolume.SetProperty("volume", 1.0) // Start with normal volume
+
+	// Create volume control for asset audio (input2)
+	assetVolume, err := gst.NewElementWithProperties("volume", map[string]interface{}{
+		"name": fmt.Sprintf("assetVolume_%s", pipelineID),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create asset volume control: %v", err)
+	}
+	assetVolume.SetProperty("volume", 0.0) // Start with muted volume
 
 	// Create video processing elements for RTP stream (input1)
 	videoQueue1, err := gst.NewElementWithProperties("queue", map[string]interface{}{
@@ -376,12 +400,14 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	if err != nil {
 		return nil, fmt.Errorf("failed to create audio queue 1: %v", err)
 	}
-	audioQueue1.SetProperty("max-size-buffers", 300)                   // Increased for audio continuity
-	audioQueue1.SetProperty("max-size-time", uint64(1000*1000000))     // Increased to 1 second
-	audioQueue1.SetProperty("min-threshold-time", uint64(200*1000000)) // Increased to 200ms
+	// Much larger buffer settings for audio continuity - prevent cutting
+	audioQueue1.SetProperty("max-size-buffers", 1000)                  // Significantly increased for audio continuity
+	audioQueue1.SetProperty("max-size-time", uint64(2000*1000000))     // Increased to 2 seconds
+	audioQueue1.SetProperty("min-threshold-time", uint64(500*1000000)) // Increased to 500ms
 	audioQueue1.SetProperty("sync", false)                             // Disable sync for real-time
 	audioQueue1.SetProperty("leaky", 0)                                // No leaking for audio continuity
 	audioQueue1.SetProperty("max-size-bytes", 0)                       // No byte limit
+	audioQueue1.SetProperty("silent", false)                           // Don't output silence when underrun
 
 	// Create audio processing elements for asset stream (audio2)
 	audioQueue2, err := gst.NewElementWithProperties("queue", map[string]interface{}{
@@ -390,12 +416,14 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	if err != nil {
 		return nil, fmt.Errorf("failed to create audio queue 2: %v", err)
 	}
-	audioQueue2.SetProperty("max-size-buffers", 300)                   // Increased for audio continuity
-	audioQueue2.SetProperty("max-size-time", uint64(1000*1000000))     // Increased to 1 second
-	audioQueue2.SetProperty("min-threshold-time", uint64(200*1000000)) // Increased to 200ms
+	// Much larger buffer settings for audio continuity - prevent cutting
+	audioQueue2.SetProperty("max-size-buffers", 1000)                  // Significantly increased for audio continuity
+	audioQueue2.SetProperty("max-size-time", uint64(2000*1000000))     // Increased to 2 seconds
+	audioQueue2.SetProperty("min-threshold-time", uint64(500*1000000)) // Increased to 500ms
 	audioQueue2.SetProperty("sync", false)                             // Disable sync for real-time
 	audioQueue2.SetProperty("leaky", 0)                                // No leaking for audio continuity
 	audioQueue2.SetProperty("max-size-bytes", 0)                       // No byte limit
+	audioQueue2.SetProperty("silent", false)                           // Don't output silence when underrun
 
 	// Create audio processing chain elements
 	aacparse1, err := gst.NewElementWithProperties("aacparse", map[string]interface{}{
@@ -440,12 +468,14 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	if err != nil {
 		return nil, fmt.Errorf("failed to create audio muxer queue: %v", err)
 	}
-	audioMuxerQueue.SetProperty("max-size-buffers", 500)                   // Increased significantly for audio continuity
-	audioMuxerQueue.SetProperty("max-size-time", uint64(1000*1000000))     // Increased to 1 second
-	audioMuxerQueue.SetProperty("min-threshold-time", uint64(200*1000000)) // Increased to 200ms
-	audioMuxerQueue.SetProperty("sync", false)                             // Disable sync for real-time
-	audioMuxerQueue.SetProperty("leaky", 0)                                // No leaking for audio continuity
-	audioMuxerQueue.SetProperty("max-size-bytes", 0)                       // No byte limit
+	// Much larger buffer settings for audio continuity - prevent cutting in final output
+	audioMuxerQueue.SetProperty("max-size-buffers", 2000)                   // Significantly increased for audio continuity
+	audioMuxerQueue.SetProperty("max-size-time", uint64(3000*1000000))      // Increased to 3 seconds
+	audioMuxerQueue.SetProperty("min-threshold-time", uint64(1000*1000000)) // Increased to 1 second
+	audioMuxerQueue.SetProperty("sync", false)                              // Disable sync for real-time
+	audioMuxerQueue.SetProperty("leaky", 0)                                 // No leaking for audio continuity
+	audioMuxerQueue.SetProperty("max-size-bytes", 0)                        // No byte limit
+	audioMuxerQueue.SetProperty("silent", false)                            // Don't output silence when underrun
 
 	// Muxer and output elements
 	mpegtsmux, err := gst.NewElementWithProperties("mpegtsmux", map[string]interface{}{
@@ -515,7 +545,6 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	// Configure pipeline latency for proper synchronization
 	// Use a more conservative latency setting to avoid conflicts
 	pipeline.SetProperty("latency", int64(500*1000000)) // 500ms pipeline latency for live streaming
-
 	x264enc.SetProperty("tune", "zerolatency")
 
 	// Audio encoder properties
@@ -523,7 +552,10 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	voaacenc.SetProperty("channels", 2)     // Stereo
 
 	// Audio resampler properties for better compatibility
-	audioresample.SetProperty("quality", 10) // Highest quality
+	audioresample.SetProperty("quality", 10)           // Highest quality
+	audioresample.SetProperty("in-samplerate", 48000)  // Input sample rate
+	audioresample.SetProperty("out-samplerate", 48000) // Output sample rate
+	audioresample.SetProperty("filter-mode", 0)        // High quality filter mode
 
 	// AAC parser properties
 	aacparse1.SetProperty("outputformat", 0) // ADTS format
@@ -567,6 +599,7 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 		intervideosink1, interaudiosink1,
 		intervideo1, intervideo2, videomixer,
 		interaudio1, interaudio2, audiomixer,
+		rtpVolume, assetVolume, // Add volume controls
 		videoQueue1, videoQueue2, videoconvert, videomixerCapsfilter, videomixerOutputCapsfilter, x264enc, h264parse2, videoMuxerQueue,
 		audioQueue1, audioQueue2, aacparse1, audioconvert, audioresample, voaacenc, aacparse2,
 		audioMuxerQueue, mpegtsmux, rtpmp2tpay,
@@ -634,12 +667,18 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 		return nil, fmt.Errorf("failed to link interaudio2 to audioQueue2: %v", err)
 	}
 
-	// Link audio processing chain
-	if err := audioQueue1.Link(audiomixer); err != nil {
-		return nil, fmt.Errorf("failed to link audioQueue1 to audiomixer: %v", err)
+	// Link audio processing chain with volume controls
+	if err := audioQueue1.Link(rtpVolume); err != nil {
+		return nil, fmt.Errorf("failed to link audioQueue1 to rtpVolume: %v", err)
 	}
-	if err := audioQueue2.Link(audiomixer); err != nil {
-		return nil, fmt.Errorf("failed to link audioQueue2 to audiomixer: %v", err)
+	if err := rtpVolume.Link(audiomixer); err != nil {
+		return nil, fmt.Errorf("failed to link rtpVolume to audiomixer: %v", err)
+	}
+	if err := audioQueue2.Link(assetVolume); err != nil {
+		return nil, fmt.Errorf("failed to link audioQueue2 to assetVolume: %v", err)
+	}
+	if err := assetVolume.Link(audiomixer); err != nil {
+		return nil, fmt.Errorf("failed to link assetVolume to audiomixer: %v", err)
 	}
 	if err := audiomixer.Link(audioconvert); err != nil {
 		return nil, fmt.Errorf("failed to link audiomixer to audioconvert: %v", err)
@@ -1006,13 +1045,14 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 					fmt.Printf("[%s] Failed to create audio demux queue: %v\n", pipelineID, err)
 					return
 				}
-				// Better queue settings for audio continuity - prevent cutting
-				audioDemuxQueue.SetProperty("max-size-buffers", 300)                   // Increased significantly for audio continuity
-				audioDemuxQueue.SetProperty("max-size-time", uint64(1000*1000000))     // Increased to 1 second
-				audioDemuxQueue.SetProperty("min-threshold-time", uint64(200*1000000)) // Increased to 200ms
+				// Much larger queue settings for audio continuity - prevent cutting from RTP
+				audioDemuxQueue.SetProperty("max-size-buffers", 1500)                  // Significantly increased for audio continuity
+				audioDemuxQueue.SetProperty("max-size-time", uint64(2500*1000000))     // Increased to 2.5 seconds
+				audioDemuxQueue.SetProperty("min-threshold-time", uint64(800*1000000)) // Increased to 800ms
 				audioDemuxQueue.SetProperty("sync", false)                             // Disable sync for real-time
 				audioDemuxQueue.SetProperty("leaky", 0)                                // No leaking to ensure audio continuity
 				audioDemuxQueue.SetProperty("max-size-bytes", 0)                       // No byte limit
+				audioDemuxQueue.SetProperty("silent", false)                           // Don't output silence when underrun
 
 				// Create aacparse for audio demux output with better configuration
 				audioAacparse, err := gst.NewElementWithProperties("aacparse", map[string]interface{}{
@@ -1162,7 +1202,7 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 				fmt.Printf("[%s] Successfully linked capsfilter to interaudiosink\n", pipelineID)
 
 				fmt.Printf("[%s] Successfully linked audio pipeline: demux -> queue -> aacparse -> decoder -> audioconvert -> audioresample -> capsfilter -> interaudiosink\n", pipelineID)
-				fmt.Printf("[%s] Audio demux queue settings: max-buffers=300, max-time=1s, min-threshold=200ms, leaky=0\n", pipelineID)
+				fmt.Printf("[%s] Audio demux queue settings: max-buffers=1500, max-time=2.5s, min-threshold=800ms, leaky=0\n", pipelineID)
 				fmt.Printf("[%s] Audio resampler quality: 10 (highest)\n", pipelineID)
 				// Mark RTP as connected if we haven't already
 				if !gp.rtpConnected {
@@ -1252,6 +1292,8 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	gp.mux = mpegtsmux
 	gp.videomixer = videomixer
 	gp.audiomixer = audiomixer
+	gp.rtpVolume = rtpVolume
+	gp.assetVolume = assetVolume
 	// gp.pipeline.SetProperty("clock", gst.NewSystemClock())
 	fmt.Printf("[%s] Pipeline created successfully\n", pipelineID)
 	return gp, nil
@@ -1264,7 +1306,7 @@ func (gp *GStreamerPipeline) createAssetPipeline() error {
 		return fmt.Errorf("failed to create asset pipeline: %v", err)
 	}
 
-	// Create playbin for asset file
+	// Create playbin for asset file with proper timing controls
 	playbin, err := gst.NewElementWithProperties("playbin3", map[string]interface{}{
 		"uri":  fmt.Sprintf("file://%s", gp.assetVideoPath),
 		"name": fmt.Sprintf("playbin_%s", gp.pipelineID),
@@ -1273,21 +1315,36 @@ func (gp *GStreamerPipeline) createAssetPipeline() error {
 		return fmt.Errorf("failed to create playbin: %v", err)
 	}
 
-	// Create video sink
+	// Set playbin properties for proper timing
+	playbin.SetProperty("async", false)                         // Disable async for better timing
+	playbin.SetProperty("sync", true)                           // Enable sync for proper timing
+	playbin.SetProperty("buffer-size", 1048576)                 // 1MB buffer
+	playbin.SetProperty("buffer-duration", int64(5*1000000000)) // 5 second buffer
+	playbin.SetProperty("rate", 1.0)                            // Ensure normal playback rate (1.0 = normal speed)
+	playbin.SetProperty("max-lateness", int64(20*1000000))      // 20ms max lateness
+	playbin.SetProperty("qos", true)                            // Enable QoS for better timing
+
+	// Create video sink with proper timing
 	intervideosink, err := gst.NewElementWithProperties("intervideosink", map[string]interface{}{
-		"channel": "input2",
-		"sync":    false,
-		"name":    fmt.Sprintf("asset_intervideosink_%s", gp.pipelineID),
+		"channel":      "input2",
+		"sync":         true, // Enable sync for proper timing
+		"name":         fmt.Sprintf("asset_intervideosink_%s", gp.pipelineID),
+		"max-lateness": int64(20 * 1000000), // 20ms max lateness
+		"qos":          true,                // Enable QoS for better timing
+		"async":        false,               // Disable async for better timing
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create intervideosink: %v", err)
 	}
 
-	// Create audio sink
+	// Create audio sink with proper timing
 	interaudiosink, err := gst.NewElementWithProperties("interaudiosink", map[string]interface{}{
-		"channel": "audio2",
-		"sync":    false,
-		"name":    fmt.Sprintf("asset_interaudiosink_%s", gp.pipelineID),
+		"channel":      "audio2",
+		"sync":         true, // Enable sync for proper timing
+		"name":         fmt.Sprintf("asset_interaudiosink_%s", gp.pipelineID),
+		"max-lateness": int64(20 * 1000000), // 20ms max lateness
+		"qos":          true,                // Enable QoS for better timing
+		"async":        false,               // Disable async for better timing
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create interaudiosink: %v", err)
@@ -1315,7 +1372,7 @@ func (gp *GStreamerPipeline) createAssetPipeline() error {
 			case gst.MessageStateChanged:
 				oldState, newState := msg.ParseStateChanged()
 				if newState == gst.StatePlaying && oldState != gst.StatePaused {
-					fmt.Printf("[%s] Asset pipeline is now PLAYING\n", gp.pipelineID)
+					fmt.Printf("[%s] Asset pipeline is now PLAYING with proper timing\n", gp.pipelineID)
 				}
 			case gst.MessageError:
 				gerr := msg.ParseError()
@@ -1328,7 +1385,7 @@ func (gp *GStreamerPipeline) createAssetPipeline() error {
 		}
 	}()
 
-	fmt.Printf("[%s] Asset pipeline created successfully\n", gp.pipelineID)
+	fmt.Printf("[%s] Asset pipeline created successfully with proper timing controls\n", gp.pipelineID)
 	gp.assetPipeline = pipeline
 	return nil
 }
@@ -1360,6 +1417,16 @@ func (gp *GStreamerPipeline) switchToAsset() {
 
 	gp.currentInput = "asset"
 	gp.assetPlaying = true
+
+	// Control audio volumes - mute RTP audio, unmute asset audio
+	if gp.rtpVolume != nil {
+		gp.rtpVolume.SetProperty("volume", 0.0) // Mute RTP audio
+		fmt.Printf("[%s] Muted RTP audio volume\n", gp.pipelineID)
+	}
+	if gp.assetVolume != nil {
+		gp.assetVolume.SetProperty("volume", 1.0) // Unmute asset audio
+		fmt.Printf("[%s] Unmuted asset audio volume\n", gp.pipelineID)
+	}
 
 	// Switch videomixer to show asset (input2) with null checks
 	pad1 := gp.videomixer.GetStaticPad("sink_0")
@@ -1412,6 +1479,16 @@ func (gp *GStreamerPipeline) switchToRTP() {
 
 	gp.currentInput = "rtp"
 	gp.assetPlaying = false
+
+	// Control audio volumes - unmute RTP audio, mute asset audio
+	if gp.rtpVolume != nil {
+		gp.rtpVolume.SetProperty("volume", 1.0) // Unmute RTP audio
+		fmt.Printf("[%s] Unmuted RTP audio volume\n", gp.pipelineID)
+	}
+	if gp.assetVolume != nil {
+		gp.assetVolume.SetProperty("volume", 0.0) // Mute asset audio
+		fmt.Printf("[%s] Muted asset audio volume\n", gp.pipelineID)
+	}
 
 	// Reset RTP connection status and restart timeout
 	gp.rtpConnected = false
@@ -1470,6 +1547,16 @@ func (gp *GStreamerPipeline) stopAsset() {
 
 	gp.assetPlaying = false
 	gp.currentInput = "rtp"
+
+	// Control audio volumes - unmute RTP audio, mute asset audio
+	if gp.rtpVolume != nil {
+		gp.rtpVolume.SetProperty("volume", 1.0) // Unmute RTP audio
+		fmt.Printf("[%s] Unmuted RTP audio volume after asset stop\n", gp.pipelineID)
+	}
+	if gp.assetVolume != nil {
+		gp.assetVolume.SetProperty("volume", 0.0) // Mute asset audio
+		fmt.Printf("[%s] Muted asset audio volume after asset stop\n", gp.pipelineID)
+	}
 
 	// Reset RTP connection status and restart timeout
 	gp.rtpConnected = false
