@@ -284,8 +284,8 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	if err != nil {
 		return nil, fmt.Errorf("failed to create videomixer capsfilter: %v", err)
 	}
-	// Set flexible caps for videomixer input with proper dimensions
-	videomixerCapsfilter.SetProperty("caps", gst.NewCapsFromString("video/x-raw,width=1920,height=1080"))
+	// Set flexible caps for videomixer input - accept any video resolution
+	videomixerCapsfilter.SetProperty("caps", gst.NewCapsFromString("video/x-raw"))
 
 	// Create capsfilter after videomixer for output format
 	videomixerOutputCapsfilter, err := gst.NewElementWithProperties("capsfilter", map[string]interface{}{
@@ -294,8 +294,8 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 	if err != nil {
 		return nil, fmt.Errorf("failed to create videomixer output capsfilter: %v", err)
 	}
-	// Set output caps for videomixer with proper dimensions
-	videomixerOutputCapsfilter.SetProperty("caps", gst.NewCapsFromString("video/x-raw,width=1920,height=1080"))
+	// Set output caps for videomixer - accept any video resolution
+	videomixerOutputCapsfilter.SetProperty("caps", gst.NewCapsFromString("video/x-raw"))
 
 	x264enc, err := gst.NewElementWithProperties("x264enc", map[string]interface{}{
 		"name": fmt.Sprintf("x264enc_%s", pipelineID),
@@ -768,8 +768,8 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 					fmt.Printf("[%s] Failed to create video output capsfilter: %v\n", pipelineID, err)
 					return
 				}
-				// Set output caps for raw video - use more flexible format to avoid negotiation issues
-				videoOutputCapsfilter.SetProperty("caps", gst.NewCapsFromString("video/x-raw,width=1920,height=1080"))
+				// Set output caps for raw video - use flexible format to accept original dimensions
+				videoOutputCapsfilter.SetProperty("caps", gst.NewCapsFromString("video/x-raw"))
 
 				// Create H.264 decoder for video with better configuration
 				videoDecoder, err := gst.NewElementWithProperties("avdec_h264", map[string]interface{}{
@@ -1345,14 +1345,11 @@ func (gp *GStreamerPipeline) switchToAsset() {
 	pad2 := gp.videomixer.GetStaticPad("sink_1")
 	if pad1 != nil && pad2 != nil {
 		pad1.SetProperty("alpha", 0.0) // Hide input1 (RTP stream)
-		pad2.SetProperty("width", 0)
-		pad2.SetProperty("height", 0)
 		pad2.SetProperty("alpha", 1.0) // Show input2 (asset)
 		pad2.SetProperty("xpos", 0)
 		pad2.SetProperty("ypos", 0)
-		pad2.SetProperty("width", 1920)
-		pad2.SetProperty("height", 1080)
-		fmt.Printf("[%s] Switched videomixer to asset content\n", gp.pipelineID)
+		// REMOVED: hardcoded width/height to allow original video dimensions
+		fmt.Printf("[%s] Switched videomixer to asset content with original dimensions\n", gp.pipelineID)
 	}
 	// Set asset pipeline to PLAYING
 	if err := gp.assetPipeline.SetState(gst.StatePlaying); err != nil {
