@@ -3,14 +3,22 @@ package main
 import (
 	"fmt"
 	"log"
+	"math"
 	"os"
-	"runtime"
 	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/go-gst/go-gst/gst"
+)
+
+// Global variables for PTS tracking and SCTE-35 handling
+var (
+	currentPTS      uint64 = 0
+	currentPTSMutex sync.Mutex
+	globalSCTE35Msg *SCTE35Message
+	scte35Mutex     sync.Mutex
 )
 
 // Setup logging and panic recovery
@@ -29,39 +37,21 @@ func init() {
 	}()
 }
 
-// Debug helper functions
-func logMemoryStats() {
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-	log.Printf("Memory Stats - Alloc: %d MB, TotalAlloc: %d MB, Sys: %d MB, NumGC: %d",
-		m.Alloc/1024/1024, m.TotalAlloc/1024/1024, m.Sys/1024/1024, m.NumGC)
-}
-
-func logGoroutineCount() {
-	log.Printf("Goroutines: %d", runtime.NumGoroutine())
-}
-
-// Safe element creation with logging
-func safeNewElement(factoryName string) (*gst.Element, error) {
-	log.Printf("Creating element: %s", factoryName)
-	element, err := gst.NewElement(factoryName)
-	if err != nil {
-		log.Printf("Failed to create element %s: %v", factoryName, err)
-		return nil, err
-	}
-	log.Printf("Successfully created element: %s", factoryName)
-	return element, nil
-}
-
-// Safe element linking with logging
-func safeLink(src, sink *gst.Element, description string) error {
-	log.Printf("Linking: %s", description)
-	if err := src.Link(sink); err != nil {
-		log.Printf("Failed to link %s: %v", description, err)
-		return err
-	}
-	log.Printf("Successfully linked: %s", description)
-	return nil
+// SCTE35Message represents a parsed SCTE-35 message
+type SCTE35Message struct {
+	TableID                uint8
+	SectionSyntaxIndicator bool
+	PrivateIndicator       bool
+	SectionLength          uint16
+	ProtocolVersion        uint8
+	EncryptedPacket        bool
+	EncryptionAlgorithm    uint8
+	PTSAdjustment          uint64
+	CWIndex                uint8
+	Tier                   uint16
+	SpliceCommandLength    uint16
+	SpliceCommandType      uint8
+	SpliceTime             uint64 // PTS time when splice should occur
 }
 
 // GStreamerPipeline represents a GStreamer pipeline for RTP stream processing with videomixer and audio mixer
@@ -937,12 +927,7 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 					fmt.Printf("[%s] Failed to link output capsfilter to intervideosink\n", pipelineID)
 					return
 				}
-				fmt.Printf("[%s] Successfully linked output capsfilter to intervideosink\n", pipelineID)
-
 				fmt.Printf("[%s] Successfully linked video pipeline: demux -> queue -> input_capsfilter -> h264parse -> parse_queue -> capsfilter -> decoder -> convert -> scale -> output_capsfilter -> intervideosink\n", pipelineID)
-				fmt.Printf("[%s] Video pipeline creation completed successfully\n", pipelineID)
-				fmt.Printf("[%s] Video should now be flowing to intervideosink channel 'input1'\n", pipelineID)
-				fmt.Printf("[%s] Video demux queue settings: max-buffers=500, max-time=1s, min-threshold=200ms, leaky=0\n", pipelineID)
 
 				// Force videomixer refresh to prevent black screen
 				go func() {
@@ -965,6 +950,29 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 					gp.rtpTimeout.Stop() // Stop the timeout timer
 					fmt.Printf("[%s] RTP stream connected successfully - Video pipeline should be active\n", pipelineID)
 				}
+				pad := videoDecoder.GetStaticPad("src")
+				pad.AddProbe(gst.PadProbeTypeBuffer, func(pad *gst.Pad, info *gst.PadProbeInfo) gst.PadProbeReturn {
+					buffer := info.GetBuffer()
+					if buffer != nil {
+						// Update global currentPTS
+						currentPTSMutex.Lock()
+						currentPTS = uint64(buffer.PresentationTimestamp())
+						currentPTSMutex.Unlock()
+
+						// Check if we have a SCTE-35 message and if splice time is greater than current PTS
+						scte35Mutex.Lock()
+						if globalSCTE35Msg != nil && globalSCTE35Msg.SpliceTime > currentPTS {
+							globalSCTE35Msg.SpliceTime = math.MaxUint64
+							fmt.Printf("[%s] SCTE-35 splice time (%d) > current PTS (%d), switching to asset\n",
+								pipelineID, globalSCTE35Msg.SpliceTime, currentPTS)
+							scte35Mutex.Unlock()
+							gp.switchToAsset()
+							return gst.PadProbeOK
+						}
+						scte35Mutex.Unlock()
+					}
+					return gst.PadProbeOK
+				})
 
 			} else if len(padName) >= 5 && padName[:5] == "audio" {
 				fmt.Printf("[%s] Creating audio pipeline: demux -> queue -> aacparse -> decoder -> audioconvert -> capsfilter -> interaudiosink\n", pipelineID)
@@ -1213,6 +1221,30 @@ func NewGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 			case gst.MessageInfo:
 				ginfo := msg.ParseInfo()
 				fmt.Printf("[%s] Pipeline info: %s\n", pipelineID, ginfo.Error())
+			case gst.MessageElement:
+				// Handle SCTE-35 events
+				structure := msg.GetStructure()
+				if structure != nil && structure.Name() == "scte35" {
+					fmt.Printf("[%s] Received SCTE-35 event!\n", pipelineID)
+
+					// Parse SCTE-35 message
+					scte35Msg := gp.parseSCTE35Message(structure)
+					if scte35Msg != nil {
+						fmt.Printf("[%s] SCTE-35 message parsed: CommandType=%d, SpliceTime=%d\n",
+							pipelineID, scte35Msg.SpliceCommandType, scte35Msg.SpliceTime)
+
+						// Store the SCTE-35 event globally
+						scte35Mutex.Lock()
+						globalSCTE35Msg = scte35Msg
+						scte35Mutex.Unlock()
+
+						// Check if this is an immediate trigger (SpliceCommandType 0x05 = Splice Insert)
+						if scte35Msg.SpliceCommandType == 0x05 {
+							fmt.Printf("[%s] Immediate SCTE-35 splice insert detected, switching to asset\n", pipelineID)
+							gp.switchToAsset()
+						}
+					}
+				}
 			case gst.MessageEOS:
 				fmt.Printf("[%s] Pipeline reached end of stream\n", pipelineID)
 			}
@@ -1395,6 +1427,12 @@ func (gp *GStreamerPipeline) switchToRTP() {
 	gp.currentInput = "rtp"
 	gp.assetPlaying = false
 
+	// Reset currentPTS to 0 after playing local asset
+	currentPTSMutex.Lock()
+	currentPTS = 0
+	currentPTSMutex.Unlock()
+	fmt.Printf("[%s] Reset currentPTS to 0 after playing local asset\n", gp.pipelineID)
+
 	// Control audio volumes - unmute RTP audio, mute asset audio
 	if gp.rtpVolume != nil {
 		gp.rtpVolume.SetProperty("volume", 1.0) // Unmute RTP audio
@@ -1410,7 +1448,7 @@ func (gp *GStreamerPipeline) switchToRTP() {
 	if gp.rtpTimeout != nil {
 		gp.rtpTimeout.Stop()
 	}
-	gp.rtpTimeout = time.NewTimer(30 * time.Second)
+	gp.rtpTimeout = time.NewTimer(10 * time.Second)
 
 	// Start monitoring for RTP timeout again
 	go func() {
@@ -1459,6 +1497,12 @@ func (gp *GStreamerPipeline) stopAsset() {
 
 	gp.assetPlaying = false
 	gp.currentInput = "rtp"
+
+	// Reset currentPTS to 0 after stopping asset
+	currentPTSMutex.Lock()
+	currentPTS = 0
+	currentPTSMutex.Unlock()
+	fmt.Printf("[%s] Reset currentPTS to 0 after stopping asset\n", gp.pipelineID)
 
 	// Control audio volumes - unmute RTP audio, mute asset audio
 	if gp.rtpVolume != nil {
@@ -1588,4 +1632,65 @@ func RunGStreamerPipeline(inputHost string, inputPort int, outputHost string, ou
 
 	// Keep the pipeline running
 	select {}
+}
+
+// parseSCTE35Message parses a SCTE-35 message from GStreamer structure data
+func (gp *GStreamerPipeline) parseSCTE35Message(structure *gst.Structure) *SCTE35Message {
+	msg := &SCTE35Message{}
+
+	// Parse basic fields from the structure
+	if tableID, _ := structure.GetValue("table-id"); tableID != nil {
+		if val, ok := tableID.(uint8); ok {
+			msg.TableID = val
+		}
+	}
+
+	if sectionLength, _ := structure.GetValue("section-length"); sectionLength != nil {
+		if val, ok := sectionLength.(uint16); ok {
+			msg.SectionLength = val
+		}
+	}
+
+	if spliceCommandType, _ := structure.GetValue("splice-command-type"); spliceCommandType != nil {
+		if val, ok := spliceCommandType.(uint8); ok {
+			msg.SpliceCommandType = val
+		}
+	}
+
+	// Parse PTS adjustment if available
+	if ptsAdjustment, _ := structure.GetValue("pts-adjustment"); ptsAdjustment != nil {
+		if val, ok := ptsAdjustment.(uint64); ok {
+			msg.PTSAdjustment = val
+		}
+	}
+
+	// Parse splice time if available - this is the key field for timing
+	if spliceTime, _ := structure.GetValue("splice-time"); spliceTime != nil {
+		if val, ok := spliceTime.(uint64); ok {
+			msg.SpliceTime = val
+		}
+	}
+
+	// Also try alternative field names that GStreamer might use
+	if spliceTime, _ := structure.GetValue("pts_time"); spliceTime != nil {
+		if val, ok := spliceTime.(uint64); ok {
+			msg.SpliceTime = val
+		}
+	}
+
+	if spliceTime, _ := structure.GetValue("pts-time"); spliceTime != nil {
+		if val, ok := spliceTime.(uint64); ok {
+			msg.SpliceTime = val
+		}
+	}
+
+	return msg
+}
+
+// abs returns the absolute value of an int64
+func abs(x int64) int64 {
+	if x < 0 {
+		return -x
+	}
+	return x
 }

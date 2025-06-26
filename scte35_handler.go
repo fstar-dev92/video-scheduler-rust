@@ -10,22 +10,6 @@ import (
 	"github.com/google/uuid"
 )
 
-// SCTE35Message represents a parsed SCTE-35 message
-type SCTE35Message struct {
-	TableID                uint8
-	SectionSyntaxIndicator bool
-	PrivateIndicator       bool
-	SectionLength          uint16
-	ProtocolVersion        uint8
-	EncryptedPacket        bool
-	EncryptionAlgorithm    uint8
-	PTSAdjustment          uint64
-	CWIndex                uint8
-	Tier                   uint16
-	SpliceCommandLength    uint16
-	SpliceCommandType      uint8
-}
-
 // AdInsertionHandler handles SCTE-35 messages and ad insertion using compositor/audiomixer
 type AdInsertionHandler struct {
 	inputHost           string
