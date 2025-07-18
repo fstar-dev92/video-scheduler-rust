@@ -41,22 +41,13 @@ func start() {
 	tsdemux, _ := gst.NewElementWithProperties("tsdemux", map[string]interface{}{
 		"program-number": programNumber,
 	})
-	// Video branch
-	videoQueue, _ := gst.NewElement("queue")
-	h264parse, _ := gst.NewElement("h264parse")
-	mpegvideoparse, _ := gst.NewElement("mpegvideoparse")
-
-	// Audio branch
-	audioQueue, _ := gst.NewElement("queue")
-	ac3parse, _ := gst.NewElement("ac3parse")
-	// Muxer and sink
 	mpegtsmux, _ := gst.NewElement("mpegtsmux")
 	filesink, _ := gst.NewElementWithProperties("filesink", map[string]interface{}{
 		"location": outputFile,
 	})
 
-	// Add all elements to pipeline
-	pipeline.AddMany(udpsrc, queue2, tsdemux, videoQueue, h264parse, mpegvideoparse, audioQueue, ac3parse, mpegtsmux, filesink)
+	// Add static elements to pipeline
+	pipeline.AddMany(udpsrc, queue2, tsdemux, mpegtsmux, filesink)
 
 	// Link udpsrc -> queue2 -> tsdemux
 	if err := udpsrc.Link(queue2); err != nil {
@@ -66,57 +57,81 @@ func start() {
 		log.Fatalf("Failed to link queue2 to tsdemux: %v", err)
 	}
 
-	// Handle dynamic pads from tsdemux
+	// Link mpegtsmux -> filesink
+	if err := mpegtsmux.Link(filesink); err != nil {
+		log.Fatalf("Failed to link mpegtsmux to filesink: %v", err)
+	}
+
 	tsdemux.Connect("pad-added", func(self *gst.Element, pad *gst.Pad) {
 		padName := pad.GetName()
 		caps := pad.GetCurrentCaps().String()
 		fmt.Println("Pad name:", padName, "Caps:", caps)
 		if len(padName) >= 5 && padName[:5] == "video" {
+			var parser *gst.Element
+			var queue *gst.Element
+			queue, _ = gst.NewElement("queue")
 			if strings.Contains(caps, "video/x-h264") {
-				parserSinkPad := h264parse.GetStaticPad("sink")
-				if !parserSinkPad.IsLinked() {
-					if pad.Link(parserSinkPad) != gst.PadLinkOK {
-						log.Println("Failed to link tsdemux video pad to h264parse")
-					}
-					if err := h264parse.Link(mpegtsmux); err != nil {
-						log.Println("Failed to link h264parse to mpegtsmux:", err)
-					}
-				}
+				parser, _ = gst.NewElement("h264parse")
 			} else if strings.Contains(caps, "video/mpeg") {
-				parserSinkPad := mpegvideoparse.GetStaticPad("sink")
-				if !parserSinkPad.IsLinked() {
-					if pad.Link(parserSinkPad) != gst.PadLinkOK {
-						log.Println("Failed to link tsdemux video pad to mpegvideoparse")
-					}
-					if err := mpegvideoparse.Link(mpegtsmux); err != nil {
-						log.Println("Failed to link mpegvideoparse to mpegtsmux:", err)
-					}
-				}
+				parser, _ = gst.NewElement("mpegvideoparse")
+			} else if strings.Contains(caps, "video/x-h265") {
+				parser, _ = gst.NewElement("h265parse")
 			} else {
 				log.Println("Unsupported video caps:", caps)
+				return
+			}
+			pipeline.AddMany(queue, parser)
+			queue.SyncStateWithParent()
+			parser.SyncStateWithParent()
+			if pad.Link(queue.GetStaticPad("sink")) != gst.PadLinkOK {
+				log.Println("Failed to link tsdemux video pad to queue")
+				return
+			}
+			if err := queue.Link(parser); err != nil {
+				log.Println("Failed to link queue to parser:", err)
+			}
+			if err := parser.Link(mpegtsmux); err != nil {
+				log.Println("Failed to link parser to mpegtsmux:", err)
 			}
 		} else if len(padName) >= 5 && padName[:5] == "audio" {
-			audioSinkPad := audioQueue.GetStaticPad("sink")
-			if !audioSinkPad.IsLinked() {
-				if pad.Link(audioSinkPad) != gst.PadLinkOK {
-					log.Println("Failed to link tsdemux audio pad to audio queue")
-				}
+			var parser *gst.Element
+			var queue *gst.Element
+			queue, _ = gst.NewElement("queue")
+			if strings.Contains(caps, "audio/mpeg") {
+				parser, _ = gst.NewElement("aacparse")
+			} else if strings.Contains(caps, "audio/x-ac3") {
+				parser, _ = gst.NewElement("ac3parse")
+			} else if strings.Contains(caps, "audio/x-eac3") {
+				parser, _ = gst.NewElement("eac3parse")
+			} else if strings.Contains(caps, "audio/x-opus") {
+				parser, _ = gst.NewElement("opusparse")
+			} else {
+				log.Println("Unsupported audio caps:", caps)
+				return
+			}
+			pipeline.AddMany(queue, parser)
+			queue.SyncStateWithParent()
+			parser.SyncStateWithParent()
+			if pad.Link(queue.GetStaticPad("sink")) != gst.PadLinkOK {
+				log.Println("Failed to link tsdemux audio pad to queue")
+				return
+			}
+			if err := queue.Link(parser); err != nil {
+				log.Println("Failed to link queue to parser:", err)
+				return
+			}
+			// Request a new sink pad from mpegtsmux for this audio stream
+			muxSinkPad := mpegtsmux.GetRequestPad("sink_%d")
+			if muxSinkPad == nil {
+				log.Println("Failed to get request pad from mpegtsmux for audio")
+				return
+			}
+			parserSrcPad := parser.GetStaticPad("src")
+			if parserSrcPad.Link(muxSinkPad) != gst.PadLinkOK {
+				log.Println("Failed to link parser to mpegtsmux sink pad")
 			}
 		}
 	})
-
-	// Link audio branch: audioQueue -> ac3parse -> mpegtsmux
-	if err := audioQueue.Link(ac3parse); err != nil {
-		log.Fatalf("Failed to link audioQueue to ac3parse: %v", err)
-	}
-	if err := ac3parse.Link(mpegtsmux); err != nil {
-		log.Fatalf("Failed to link ac3parse to mpegtsmux: %v", err)
-	}
-
-	// Link mpegtsmux -> filesink
-	if err := mpegtsmux.Link(filesink); err != nil {
-		log.Fatalf("Failed to link mpegtsmux to filesink: %v", err)
-	}
 
 	if err := pipeline.SetState(gst.StatePlaying); err != nil {
 		log.Fatalf("Failed to set pipeline to PLAYING: %v", err)
