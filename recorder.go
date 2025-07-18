@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/go-gst/go-gst/gst"
@@ -43,6 +44,8 @@ func start() {
 	// Video branch
 	videoQueue, _ := gst.NewElement("queue")
 	h264parse, _ := gst.NewElement("h264parse")
+	mpegvideoparse, _ := gst.NewElement("mpegvideoparse")
+
 	// Audio branch
 	audioQueue, _ := gst.NewElement("queue")
 	ac3parse, _ := gst.NewElement("ac3parse")
@@ -53,7 +56,7 @@ func start() {
 	})
 
 	// Add all elements to pipeline
-	pipeline.AddMany(udpsrc, queue2, tsdemux, videoQueue, h264parse, audioQueue, ac3parse, mpegtsmux, filesink)
+	pipeline.AddMany(udpsrc, queue2, tsdemux, videoQueue, h264parse, mpegvideoparse, audioQueue, ac3parse, mpegtsmux, filesink)
 
 	// Link udpsrc -> queue2 -> tsdemux
 	if err := udpsrc.Link(queue2); err != nil {
@@ -66,13 +69,31 @@ func start() {
 	// Handle dynamic pads from tsdemux
 	tsdemux.Connect("pad-added", func(self *gst.Element, pad *gst.Pad) {
 		padName := pad.GetName()
-		fmt.Println("Pad name:", padName, "Caps:", pad.GetCurrentCaps().String())
+		caps := pad.GetCurrentCaps().String()
+		fmt.Println("Pad name:", padName, "Caps:", caps)
 		if len(padName) >= 5 && padName[:5] == "video" {
-			videoSinkPad := videoQueue.GetStaticPad("sink")
-			if !videoSinkPad.IsLinked() {
-				if pad.Link(videoSinkPad) != gst.PadLinkOK {
-					log.Println("Failed to link tsdemux video pad to video queue")
+			if strings.Contains(caps, "video/x-h264") {
+				parserSinkPad := h264parse.GetStaticPad("sink")
+				if !parserSinkPad.IsLinked() {
+					if pad.Link(parserSinkPad) != gst.PadLinkOK {
+						log.Println("Failed to link tsdemux video pad to h264parse")
+					}
+					if err := h264parse.Link(mpegtsmux); err != nil {
+						log.Println("Failed to link h264parse to mpegtsmux:", err)
+					}
 				}
+			} else if strings.Contains(caps, "video/mpeg") {
+				parserSinkPad := mpegvideoparse.GetStaticPad("sink")
+				if !parserSinkPad.IsLinked() {
+					if pad.Link(parserSinkPad) != gst.PadLinkOK {
+						log.Println("Failed to link tsdemux video pad to mpegvideoparse")
+					}
+					if err := mpegvideoparse.Link(mpegtsmux); err != nil {
+						log.Println("Failed to link mpegvideoparse to mpegtsmux:", err)
+					}
+				}
+			} else {
+				log.Println("Unsupported video caps:", caps)
 			}
 		} else if len(padName) >= 5 && padName[:5] == "audio" {
 			audioSinkPad := audioQueue.GetStaticPad("sink")
@@ -83,14 +104,6 @@ func start() {
 			}
 		}
 	})
-
-	// Link video branch: videoQueue -> h264parse -> mpegtsmux
-	if err := videoQueue.Link(h264parse); err != nil {
-		log.Fatalf("Failed to link videoQueue to h264parse: %v", err)
-	}
-	if err := h264parse.Link(mpegtsmux); err != nil {
-		log.Fatalf("Failed to link h264parse to mpegtsmux: %v", err)
-	}
 
 	// Link audio branch: audioQueue -> ac3parse -> mpegtsmux
 	if err := audioQueue.Link(ac3parse); err != nil {
