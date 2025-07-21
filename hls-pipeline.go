@@ -238,9 +238,14 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 	if err != nil {
 		return nil, fmt.Errorf("failed to create video queue 1: %v", err)
 	}
-	videoQueue1.SetProperty("max-size-buffers", 100)
-	videoQueue1.SetProperty("max-size-time", uint64(700*1000000))
-	videoQueue1.SetProperty("min-threshold-time", uint64(50*1000000))
+	// Optimize for seamless HLS playback
+	videoQueue1.SetProperty("max-size-buffers", 50)                   // Reduced from 100
+	videoQueue1.SetProperty("max-size-time", uint64(500*1000000))     // Reduced from 700ms to 500ms
+	videoQueue1.SetProperty("min-threshold-time", uint64(20*1000000)) // Reduced from 50ms to 20ms
+	videoQueue1.SetProperty("sync", false)
+	videoQueue1.SetProperty("leaky", 2) // Leak downstream (newer frames)
+	videoQueue1.SetProperty("max-size-bytes", 0)
+	videoQueue1.SetProperty("silent", false)
 
 	// Create video processing elements for asset stream (input2)
 	videoQueue2, err := gst.NewElementWithProperties("queue", map[string]interface{}{
@@ -249,9 +254,14 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 	if err != nil {
 		return nil, fmt.Errorf("failed to create video queue 2: %v", err)
 	}
-	videoQueue2.SetProperty("max-size-buffers", 100)
-	videoQueue2.SetProperty("max-size-time", uint64(700*1000000))
-	videoQueue2.SetProperty("min-threshold-time", uint64(50*1000000))
+	// Optimize for seamless HLS playback
+	videoQueue2.SetProperty("max-size-buffers", 50)                   // Reduced from 100
+	videoQueue2.SetProperty("max-size-time", uint64(500*1000000))     // Reduced from 700ms to 500ms
+	videoQueue2.SetProperty("min-threshold-time", uint64(20*1000000)) // Reduced from 50ms to 20ms
+	videoQueue2.SetProperty("sync", false)
+	videoQueue2.SetProperty("leaky", 2) // Leak downstream (newer frames)
+	videoQueue2.SetProperty("max-size-bytes", 0)
+	videoQueue2.SetProperty("silent", false)
 
 	// Create video processing chain elements
 	videoconvert, err := gst.NewElementWithProperties("videoconvert", map[string]interface{}{
@@ -314,11 +324,12 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 	if err != nil {
 		return nil, fmt.Errorf("failed to create audio queue 1: %v", err)
 	}
-	audioQueue1.SetProperty("max-size-buffers", 1000)
-	audioQueue1.SetProperty("max-size-time", uint64(2000*1000000))
-	audioQueue1.SetProperty("min-threshold-time", uint64(500*1000000))
+	// Optimize for seamless HLS playback
+	audioQueue1.SetProperty("max-size-buffers", 500)                   // Reduced from 1000
+	audioQueue1.SetProperty("max-size-time", uint64(1000*1000000))     // Reduced from 2000ms to 1000ms
+	audioQueue1.SetProperty("min-threshold-time", uint64(200*1000000)) // Reduced from 500ms to 200ms
 	audioQueue1.SetProperty("sync", false)
-	audioQueue1.SetProperty("leaky", 0)
+	audioQueue1.SetProperty("leaky", 2) // Leak downstream (newer frames)
 	audioQueue1.SetProperty("max-size-bytes", 0)
 	audioQueue1.SetProperty("silent", false)
 
@@ -329,11 +340,12 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 	if err != nil {
 		return nil, fmt.Errorf("failed to create audio queue 2: %v", err)
 	}
-	audioQueue2.SetProperty("max-size-buffers", 1000)
-	audioQueue2.SetProperty("max-size-time", uint64(2000*1000000))
-	audioQueue2.SetProperty("min-threshold-time", uint64(500*1000000))
+	// Optimize for seamless HLS playback
+	audioQueue2.SetProperty("max-size-buffers", 500)                   // Reduced from 1000
+	audioQueue2.SetProperty("max-size-time", uint64(1000*1000000))     // Reduced from 2000ms to 1000ms
+	audioQueue2.SetProperty("min-threshold-time", uint64(200*1000000)) // Reduced from 500ms to 200ms
 	audioQueue2.SetProperty("sync", false)
-	audioQueue2.SetProperty("leaky", 0)
+	audioQueue2.SetProperty("leaky", 2) // Leak downstream (newer frames)
 	audioQueue2.SetProperty("max-size-bytes", 0)
 	audioQueue2.SetProperty("silent", false)
 
@@ -440,14 +452,34 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 	hlsSrc.SetProperty("retry", 3)                       // Retry 3 times
 	hlsSrc.SetProperty("user-id", "")
 	hlsSrc.SetProperty("user-pw", "")
+	// Add HLS-specific optimizations for seamless playback
+	hlsSrc.SetProperty("async", false)
+	hlsSrc.SetProperty("sync", false)
+	hlsSrc.SetProperty("max-errors", 5)
+	hlsSrc.SetProperty("max-connect-timeout", uint64(5*1000000000))    // 5 second connect timeout
+	hlsSrc.SetProperty("max-connection-timeout", uint64(5*1000000000)) // 5 second connection timeout
 
-	// Configure HLS demuxer
-	hlsDemux.SetProperty("timeout", uint64(10*1000000000)) // 10 second timeout
-	hlsDemux.SetProperty("max-errors", 3)                  // Max 3 errors before giving up
+	// Configure HLS demuxer for seamless playback
+	hlsDemux.SetProperty("timeout", uint64(5*1000000000)) // Reduced to 5 second timeout
+	hlsDemux.SetProperty("max-errors", 5)                 // Increased max errors
+	hlsDemux.SetProperty("async", false)
+	hlsDemux.SetProperty("sync", false)
+	// Add segment handling optimizations
+	hlsDemux.SetProperty("segment-duration", uint64(2*1000000000)) // 2 second segments
+	hlsDemux.SetProperty("segment-start-time", int64(0))
+	hlsDemux.SetProperty("segment-stop-time", int64(-1)) // -1 means until end
+	hlsDemux.SetProperty("segment-repeat", 0)            // No repeat
+	hlsDemux.SetProperty("segment-offset", int64(0))
+	hlsDemux.SetProperty("segment-trickmode-interval", uint64(0)) // No trick mode
 
 	// Configure pipeline latency
-	pipeline.SetProperty("latency", int64(500*1000000))
+	pipeline.SetProperty("latency", int64(200*1000000)) // Reduced from 500ms to 200ms for lower latency
 	x264enc.SetProperty("tune", "zerolatency")
+	// Add HLS-specific encoder optimizations
+	x264enc.SetProperty("speed-preset", "ultrafast") // Fastest encoding for low latency
+	x264enc.SetProperty("key-int-max", 30)           // Keyframe interval for HLS segments
+	x264enc.SetProperty("bframes", 0)                // No B-frames for lower latency
+	x264enc.SetProperty("ref", 1)                    // Single reference frame for lower latency
 
 	// Audio encoder properties
 	voaacenc.SetProperty("bitrate", 128000)
@@ -609,12 +641,61 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 			return
 		}
 
-		// Link HLS demuxer output to tsdemux
-		if pad.Link(tsdemux.GetStaticPad("sink")) != gst.PadLinkOK {
-			fmt.Printf("[%s] Failed to link HLS demuxer to tsdemux\n", pipelineID)
+		// Print pad caps for debugging
+		padCaps := pad.GetCurrentCaps()
+		if padCaps != nil {
+			fmt.Printf("[%s] HLS demuxer pad caps: %v\n", pipelineID, padCaps.String())
 		} else {
-			fmt.Printf("[%s] Successfully linked HLS demuxer to tsdemux\n", pipelineID)
+			fmt.Printf("[%s] HLS demuxer pad has no caps yet\n", pipelineID)
 		}
+
+		// Add a small delay to ensure TS demuxer is ready
+		go func() {
+			time.Sleep(50 * time.Millisecond) // Reduced from 100ms to 50ms for faster segment transitions
+
+			// Link HLS demuxer output to tsdemux
+			tsdemuxSinkPad := tsdemux.GetStaticPad("sink")
+			if tsdemuxSinkPad == nil {
+				fmt.Printf("[%s] TS demuxer sink pad is nil\n", pipelineID)
+				return
+			}
+
+			// Check if TS demuxer sink pad is already linked
+			if tsdemuxSinkPad.IsLinked() {
+				fmt.Printf("[%s] TS demuxer sink pad is already linked\n", pipelineID)
+				return
+			}
+
+			// Check TS demuxer state
+			tsdemuxState := tsdemux.GetCurrentState()
+			fmt.Printf("[%s] TS demuxer state before linking: %s\n", pipelineID, tsdemuxState.String())
+
+			linkResult := pad.Link(tsdemuxSinkPad)
+			if linkResult != gst.PadLinkOK {
+				fmt.Printf("[%s] Failed to link HLS demuxer to tsdemux: %v\n", pipelineID, linkResult)
+				fmt.Printf("[%s] HLS pad caps: %v\n", pipelineID, pad.GetCurrentCaps())
+				fmt.Printf("[%s] TS demuxer sink pad caps: %v\n", pipelineID, tsdemuxSinkPad.GetCurrentCaps())
+
+				// Try to set TS demuxer to PLAYING state and retry
+				if tsdemuxState != gst.StatePlaying {
+					fmt.Printf("[%s] Setting TS demuxer to PLAYING state and retrying...\n", pipelineID)
+					if err := tsdemux.SetState(gst.StatePlaying); err != nil {
+						fmt.Printf("[%s] Failed to set TS demuxer to PLAYING: %v\n", pipelineID, err)
+						return
+					}
+					time.Sleep(25 * time.Millisecond) // Reduced from 50ms to 25ms
+
+					linkResult = pad.Link(tsdemuxSinkPad)
+					if linkResult != gst.PadLinkOK {
+						fmt.Printf("[%s] Retry failed to link HLS demuxer to tsdemux: %v\n", pipelineID, linkResult)
+					} else {
+						fmt.Printf("[%s] Successfully linked HLS demuxer to tsdemux on retry\n", pipelineID)
+					}
+				}
+			} else {
+				fmt.Printf("[%s] Successfully linked HLS demuxer to tsdemux\n", pipelineID)
+			}
+		}()
 	})
 
 	// Set up dynamic pad-added signal for tsdemux
@@ -684,12 +765,14 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 					fmt.Printf("[%s] Failed to set videoDemuxQueue to PLAYING: %v\n", pipelineID, err)
 					return
 				}
-				videoDemuxQueue.SetProperty("max-size-buffers", 500)
-				videoDemuxQueue.SetProperty("max-size-time", uint64(1000*1000000))
-				videoDemuxQueue.SetProperty("min-threshold-time", uint64(200*1000000))
+				// Optimize for seamless HLS segment transitions
+				videoDemuxQueue.SetProperty("max-size-buffers", 200)                  // Reduced from 500
+				videoDemuxQueue.SetProperty("max-size-time", uint64(500*1000000))     // Reduced from 1000ms to 500ms
+				videoDemuxQueue.SetProperty("min-threshold-time", uint64(50*1000000)) // Reduced from 200ms to 50ms
 				videoDemuxQueue.SetProperty("sync", false)
-				videoDemuxQueue.SetProperty("leaky", 0)
+				videoDemuxQueue.SetProperty("leaky", 2) // Leak downstream (newer frames)
 				videoDemuxQueue.SetProperty("max-size-bytes", 0)
+				videoDemuxQueue.SetProperty("silent", false)
 
 				// Create video processing elements
 				videoInputCapsfilter, err := gst.NewElementWithProperties("capsfilter", map[string]interface{}{
@@ -986,7 +1069,7 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 							fmt.Printf("[%s] SCTE-35 splice time (%d) > current PTS (%d), switching to asset\n",
 								pipelineID, hlsGlobalSCTE35Msg.SpliceTime, hlsCurrentPTS)
 							hlsScte35Mutex.Unlock()
-							gp.switchToAsset()
+							// gp.switchToAsset()
 							return gst.PadProbeOK
 						}
 						hlsScte35Mutex.Unlock()
@@ -1005,12 +1088,12 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 					fmt.Printf("[%s] Failed to create audio demux queue: %v\n", pipelineID, err)
 					return
 				}
-				// Set properties before adding to pipeline
-				audioDemuxQueue.SetProperty("max-size-buffers", 1500)
-				audioDemuxQueue.SetProperty("max-size-time", uint64(2500*1000000))
-				audioDemuxQueue.SetProperty("min-threshold-time", uint64(800*1000000))
+				// Optimize for seamless HLS segment transitions
+				audioDemuxQueue.SetProperty("max-size-buffers", 750)                   // Reduced from 1500
+				audioDemuxQueue.SetProperty("max-size-time", uint64(1500*1000000))     // Reduced from 2500ms to 1500ms
+				audioDemuxQueue.SetProperty("min-threshold-time", uint64(300*1000000)) // Reduced from 800ms to 300ms
 				audioDemuxQueue.SetProperty("sync", false)
-				audioDemuxQueue.SetProperty("leaky", 0)
+				audioDemuxQueue.SetProperty("leaky", 2) // Leak downstream (newer frames)
 				audioDemuxQueue.SetProperty("max-size-bytes", 0)
 				audioDemuxQueue.SetProperty("silent", false)
 
@@ -1192,42 +1275,89 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 
 				if newState == gst.StatePaused && oldState == gst.StateReady {
 					fmt.Printf("[%s] Pipeline stuck in PAUSED state - likely no HLS data received\n", pipelineID)
-					go func() {
-						time.Sleep(5 * time.Second)
-						if gp.running && !gp.hlsConnected {
-							fmt.Printf("[%s] Pipeline still not receiving HLS data, switching to asset\n", pipelineID)
-							gp.switchToAsset()
-						}
-					}()
+					// Add more debugging for HLS source
+					if hlsSrc != nil {
+						fmt.Printf("[%s] HLS source state: %s\n", pipelineID, hlsSrc.GetCurrentState().String())
+					}
+					if hlsDemux != nil {
+						fmt.Printf("[%s] HLS demuxer state: %s\n", pipelineID, hlsDemux.GetCurrentState().String())
+					}
+					// go func() {
+					// 	time.Sleep(5 * time.Second)
+					// 	if gp.running && !gp.hlsConnected {
+					// 		fmt.Printf("[%s] Pipeline still not receiving HLS data, switching to asset\n", pipelineID)
+					// 		gp.switchToAsset()
+					// 	}
+					// }()
 				}
 
 				if newState == gst.StatePaused && oldState == gst.StatePlaying {
 					fmt.Printf("[%s] Pipeline went from PLAYING to PAUSED - checking for HLS data issues\n", pipelineID)
-					go func() {
-						time.Sleep(2 * time.Second)
-						if gp.running && !gp.hlsConnected {
-							fmt.Printf("[%s] Pipeline paused due to no HLS data, switching to asset\n", pipelineID)
-							gp.switchToAsset()
-						}
-					}()
+					// Add debugging for element states
+					if hlsSrc != nil {
+						fmt.Printf("[%s] HLS source state: %s\n", pipelineID, hlsSrc.GetCurrentState().String())
+					}
+					if hlsDemux != nil {
+						fmt.Printf("[%s] HLS demuxer state: %s\n", pipelineID, hlsDemux.GetCurrentState().String())
+					}
+					if tsdemux != nil {
+						fmt.Printf("[%s] TS demuxer state: %s\n", pipelineID, tsdemux.GetCurrentState().String())
+					}
+					// go func() {
+					// 	time.Sleep(2 * time.Second)
+					// 	if gp.running && !gp.hlsConnected {
+					// 		fmt.Printf("[%s] Pipeline paused due to no HLS data, switching to asset\n", pipelineID)
+					// 		gp.switchToAsset()
+					// 	}
+					// }()
 				}
 			case gst.MessageError:
 				gerr := msg.ParseError()
 				fmt.Printf("[%s] Pipeline error: %s\n", pipelineID, gerr.Error())
 
+				// Add more detailed error analysis
 				errorMsg := gerr.Error()
+				fmt.Printf("[%s] Error details: %s\n", pipelineID, errorMsg)
+
 				if strings.Contains(errorMsg, "not-negotiated") || strings.Contains(errorMsg, "Internal data stream error") {
 					fmt.Printf("[%s] Pipeline negotiation error detected - this may be due to no HLS data or format issues\n", pipelineID)
-					go func() {
-						time.Sleep(3 * time.Second)
-						if gp.running && !gp.hlsConnected {
-							fmt.Printf("[%s] Still no HLS connection after negotiation error, switching to asset\n", pipelineID)
-							gp.switchToAsset()
-						}
-					}()
+
+					// Add HLS-specific debugging
+					fmt.Printf("[%s] HLS connection status: %v\n", pipelineID, gp.hlsConnected)
+					fmt.Printf("[%s] Pipeline running status: %v\n", pipelineID, gp.running)
+
+					// Check HLS source and demuxer states
+					if hlsSrc != nil {
+						hlsSrcState := hlsSrc.GetCurrentState()
+						fmt.Printf("[%s] HLS source state: %s\n", pipelineID, hlsSrcState.String())
+					}
+					if hlsDemux != nil {
+						hlsDemuxState := hlsDemux.GetCurrentState()
+						fmt.Printf("[%s] HLS demuxer state: %s\n", pipelineID, hlsDemuxState.String())
+					}
+
+					// go func() {
+					// 	time.Sleep(3 * time.Second)
+					// 	if gp.running && !gp.hlsConnected {
+					// 		fmt.Printf("[%s] Still no HLS connection after negotiation error, switching to asset\n", pipelineID)
+					// 		gp.switchToAsset()
+					// 	}
+					// }()
 				} else if !gp.hlsConnected && (strings.Contains(errorMsg, "no pads") || strings.Contains(errorMsg, "not linked") || strings.Contains(errorMsg, "streaming")) {
 					fmt.Printf("[%s] Pipeline error likely due to no HLS data - switching to asset\n", pipelineID)
-					gp.switchToAsset()
+					// gp.switchToAsset()
+				} else {
+					// For other errors, try to get more context
+					fmt.Printf("[%s] Unknown pipeline error, checking element states...\n", pipelineID)
+					if hlsSrc != nil {
+						fmt.Printf("[%s] HLS source state: %s\n", pipelineID, hlsSrc.GetCurrentState().String())
+					}
+					if hlsDemux != nil {
+						fmt.Printf("[%s] HLS demuxer state: %s\n", pipelineID, hlsDemux.GetCurrentState().String())
+					}
+					if tsdemux != nil {
+						fmt.Printf("[%s] TS demuxer state: %s\n", pipelineID, tsdemux.GetCurrentState().String())
+					}
 				}
 			case gst.MessageWarning:
 				gwarn := msg.ParseWarning()
@@ -1250,10 +1380,10 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 						hlsGlobalSCTE35Msg = scte35Msg
 						hlsScte35Mutex.Unlock()
 
-						if scte35Msg.SpliceCommandType == 0x05 {
-							fmt.Printf("[%s] Immediate SCTE-35 splice insert detected, switching to asset\n", pipelineID)
-							gp.switchToAsset()
-						}
+						// if scte35Msg.SpliceCommandType == 0x05 {
+						// 	fmt.Printf("[%s] Immediate SCTE-35 splice insert detected, switching to asset\n", pipelineID)
+						// 	gp.switchToAsset()
+						// }
 					}
 				}
 			case gst.MessageEOS:
@@ -1441,24 +1571,24 @@ func (gp *HLSGStreamerPipeline) switchToHLS() {
 	}
 
 	gp.hlsConnected = false
-	if gp.hlsTimeout != nil {
-		gp.hlsTimeout.Stop()
-	}
-	gp.hlsTimeout = time.NewTimer(10 * time.Second)
+	// if gp.hlsTimeout != nil {
+	// 	gp.hlsTimeout.Stop()
+	// }
+	// gp.hlsTimeout = time.NewTimer(10 * time.Second)
 
-	go func() {
-		select {
-		case <-gp.hlsTimeout.C:
-			if gp.running && !gp.hlsConnected {
-				fmt.Printf("[%s] HLS connection timeout after switch back - no packets received within 10 seconds\n", gp.pipelineID)
-				fmt.Printf("[%s] Switching to asset video due to HLS timeout\n", gp.pipelineID)
-				gp.switchToAsset()
-			}
-		case <-gp.stopChan:
-			gp.hlsTimeout.Stop()
-			return
-		}
-	}()
+	// go func() {
+	// 	select {
+	// 	case <-gp.hlsTimeout.C:
+	// 		if gp.running && !gp.hlsConnected {
+	// 			fmt.Printf("[%s] HLS connection timeout after switch back - no packets received within 10 seconds\n", gp.pipelineID)
+	// 			fmt.Printf("[%s] Switching to asset video due to HLS timeout\n", gp.pipelineID)
+	// 			gp.switchToAsset()
+	// 		}
+	// 	case <-gp.stopChan:
+	// 		gp.hlsTimeout.Stop()
+	// 		return
+	// 	}
+	// }()
 
 	pad1 := gp.videomixer.GetStaticPad("sink_0")
 	pad2 := gp.videomixer.GetStaticPad("sink_1")
@@ -1556,13 +1686,13 @@ func (gp *HLSGStreamerPipeline) Start() error {
 		}
 	}()
 
-	go func() {
-		time.Sleep(10 * time.Second)
-		if gp.running && gp.hlsConnected {
-			fmt.Printf("[%s] 10 seconds elapsed, switching to asset video\n", gp.pipelineID)
-			gp.switchToAsset()
-		}
-	}()
+	// go func() {
+	// 	time.Sleep(10 * time.Second)
+	// 	if gp.running && gp.hlsConnected {
+	// 		fmt.Printf("[%s] 10 seconds elapsed, switching to asset video\n", gp.pipelineID)
+	// 		gp.switchToAsset()
+	// 	}
+	// }()
 
 	return nil
 }
