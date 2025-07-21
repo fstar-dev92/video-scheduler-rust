@@ -179,12 +179,6 @@ func (s *StreamScheduler) createMainPipeline() error {
 		pad2.SetProperty("alpha", 0.0) // input2 hidden
 	}
 
-	// Create video converter and encoder
-	videoconv, err := gst.NewElement("videoconvert")
-	if err != nil {
-		return fmt.Errorf("failed to create videoconvert: %v", err)
-	}
-
 	h264enc, err := gst.NewElementWithProperties("x264enc", map[string]interface{}{
 		"tune":    0x00000004, // zerolatency
 		"bitrate": 2000,       // 2 Mbps
@@ -217,12 +211,6 @@ func (s *StreamScheduler) createMainPipeline() error {
 	audiomixer.SetProperty("name", "audiomixer" + s.schedulerID)
 	if err != nil {
 		return fmt.Errorf("failed to create audiomixer: %v", err)
-	}
-
-	audioconv, err := gst.NewElement("audioconvert")
-	audioconv.SetProperty("name", "audioconv" + s.schedulerID)
-	if err != nil {
-		return fmt.Errorf("failed to create audioconvert: %v", err)
 	}
 
 	aacenc, err := gst.NewElementWithProperties("avenc_aac", map[string]interface{}{
@@ -324,81 +312,12 @@ func (s *StreamScheduler) createMainPipeline() error {
 		return fmt.Errorf("failed to create videoMixerQueue: %v", err)
 	}
 
-	audioMixerQueue, err := gst.NewElementWithProperties("queue", map[string]interface{}{
-		"max-size-buffers":   100,
-		"max-size-time":      uint64(500 * time.Millisecond),
-		"min-threshold-time": uint64(50 * time.Millisecond),
-		"leaky":              0, // No leaking
-		"name":               "audioMixerQueue" + s.schedulerID,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to create audioMixerQueue: %v", err)
-	}
-
-	// Add final queue before muxer
-	muxerQueue, err := gst.NewElementWithProperties("queue", map[string]interface{}{
-		"max-size-buffers":   200,
-		"max-size-time":      uint64(1 * time.Second),
-		"min-threshold-time": uint64(100 * time.Millisecond),
-		"leaky":              0, // No leaking
-		"name":               "muxerQueue" + s.schedulerID,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to create muxerQueue: %v", err)
-	}
-
-	// Create audio converter elements for each input
-	audioconv1, err := gst.NewElement("audioconvert")
-	audioconv1.SetProperty("name", "audioconv1" + s.schedulerID)
-	if err != nil {
-		return fmt.Errorf("failed to create audioconv1: %v", err)
-	}
-
-	audioconv2, err := gst.NewElement("audioconvert")
-	audioconv2.SetProperty("name", "audioconv2" + s.schedulerID)
-	if err != nil {
-		return fmt.Errorf("failed to create audioconv2: %v", err)
-	}
-
-	// Create audioresample elements to ensure rate compatibility
-	audioresample1, err := gst.NewElement("audioresample")
-	audioresample1.SetProperty("name", "audioresample1" + s.schedulerID)
-	if err != nil {
-		return fmt.Errorf("failed to create audioresample1: %v", err)
-	}
-
-	audioresample2, err := gst.NewElement("audioresample")
-	audioresample2.SetProperty("name", "audioresample2" + s.schedulerID)
-	if err != nil {
-		return fmt.Errorf("failed to create audioresample2: %v", err)
-	}
-
-	// Create capsfilters to explicitly set audio format
-	audiocaps1, err := gst.NewElementWithProperties("capsfilter", map[string]interface{}{
-		"caps": gst.NewCapsFromString("audio/x-raw, format=S16LE, layout=interleaved, rate=48000, channels=2"),
-		"name": "audiocaps1" + s.schedulerID,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to create audiocaps1: %v", err)
-	}
-
-	audiocaps2, err := gst.NewElementWithProperties("capsfilter", map[string]interface{}{
-		"caps": gst.NewCapsFromString("audio/x-raw, format=S16LE, layout=interleaved, rate=48000, channels=2"),
-		"name": "audiocaps2" + s.schedulerID,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to create audiocaps2: %v", err)
-	}
-
-	// Add all new elements to the pipeline
-	pipeline.AddMany(audioconv1, audioconv2, audioresample1, audioresample2, audiocaps1, audiocaps2)
-
 	// Add all elements to the pipeline
-	pipeline.AddMany(intervideo1, intervideo2, s.compositor, videoconv, h264enc)
-	pipeline.AddMany(interaudio1, interaudio2, audiomixer, audioconv, aacenc)
+	pipeline.AddMany(intervideo1, intervideo2, s.compositor, h264enc)
+	pipeline.AddMany(interaudio1, interaudio2, audiomixer, aacenc)
 	pipeline.AddMany(mpegtsmux, rtpmp2tpay, udpsink)
 	pipeline.AddMany(videoQueue1, videoQueue2, audioQueue1, audioQueue2)
-	pipeline.AddMany(videoMixerQueue, audioMixerQueue, muxerQueue)
+	pipeline.Add(videoMixerQueue)
 
 	// Link video elements
 	intervideo1.Link(videoQueue1)
@@ -406,27 +325,17 @@ func (s *StreamScheduler) createMainPipeline() error {
 	intervideo2.Link(videoQueue2)
 	videoQueue2.Link(s.compositor)
 	s.compositor.Link(videoMixerQueue)
-	videoMixerQueue.Link(videoconv)
-	videoconv.Link(h264enc)
-	h264enc.Link(muxerQueue)
-	muxerQueue.Link(mpegtsmux)
+	videoMixerQueue.Link(h264enc)
+	h264enc.Link(mpegtsmux)
 
 	// Link audio elements
 	interaudio1.Link(audioQueue1)
-	audioQueue1.Link(audioconv1)
-	audioconv1.Link(audioresample1)
-	audioresample1.Link(audiocaps1)
-	audiocaps1.Link(audiomixer)
+	audioQueue1.Link(audiomixer)
 
 	interaudio2.Link(audioQueue2)
-	audioQueue2.Link(audioconv2)
-	audioconv2.Link(audioresample2)
-	audioresample2.Link(audiocaps2)
-	audiocaps2.Link(audiomixer)
+	audioQueue2.Link(audiomixer)
 
-	audiomixer.Link(audioMixerQueue)
-	audioMixerQueue.Link(audioconv)
-	audioconv.Link(aacenc)
+	audiomixer.Link(aacenc)
 	aacenc.Link(mpegtsmux)
 
 	// Link muxer to RTP and UDP sink
@@ -506,11 +415,6 @@ func (s *StreamScheduler) createSourcePipeline(item StreamItem, index int, chann
 		return nil, fmt.Errorf("failed to create audioconvert: %v", err)
 	}
 
-	audioresample, err := gst.NewElement("audioresample")
-	if err != nil {
-		return nil, fmt.Errorf("failed to create audioresample: %v", err)
-	}
-
 	audiocaps, err := gst.NewElementWithProperties("capsfilter", map[string]interface{}{
 		"caps": gst.NewCapsFromString("audio/x-raw, format=S16LE, layout=interleaved, rate=48000, channels=2"),
 		"name": "audiocaps" + s.schedulerID,
@@ -530,11 +434,10 @@ func (s *StreamScheduler) createSourcePipeline(item StreamItem, index int, chann
 	}
 
 	// Add elements to bin
-	audiobin.AddMany(audioconvert, audioresample, audiocaps, interaudiosink)
+	audiobin.AddMany(audioconvert, audiocaps, interaudiosink)
 
 	// Link elements in bin
-	audioconvert.Link(audioresample)
-	audioresample.Link(audiocaps)
+	audioconvert.Link(audiocaps)
 	audiocaps.Link(interaudiosink)
 
 	// Create and add ghost pad using the bin's method

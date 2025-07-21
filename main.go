@@ -35,6 +35,7 @@ func main() {
 	fmt.Printf("Asset: %s\n", *assetPath)
 	fmt.Printf("Pipeline will switch to asset after 1 minute\n")
 
+
 	// Create a channel to handle graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
