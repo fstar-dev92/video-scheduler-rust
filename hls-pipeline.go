@@ -603,6 +603,12 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 	hlsDemux.Connect("pad-added", func(self *gst.Element, pad *gst.Pad) {
 		fmt.Printf("[%s] HLS demuxer pad added: %s\n", pipelineID, pad.GetName())
 
+		// Check if pad is already linked
+		if pad.IsLinked() {
+			fmt.Printf("[%s] Pad %s is already linked, skipping\n", pipelineID, pad.GetName())
+			return
+		}
+
 		// Link HLS demuxer output to tsdemux
 		if pad.Link(tsdemux.GetStaticPad("sink")) != gst.PadLinkOK {
 			fmt.Printf("[%s] Failed to link HLS demuxer to tsdemux\n", pipelineID)
@@ -642,12 +648,40 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 			// Check pad name to determine if it's video or audio
 			if len(padName) >= 5 && padName[:5] == "video" {
 				fmt.Printf("[%s] Creating video pipeline for HLS stream\n", pipelineID)
+
+				// Check if video elements already exist for this pad
+				elementName := fmt.Sprintf("videoDemuxQueue_%s_%s", pipelineID, padName)
+				existing, err := gp.pipeline.GetElementByName(elementName)
+				if err == nil && existing != nil {
+					fmt.Printf("[%s] Video elements for pad %s already exist, skipping creation\n", pipelineID, padName)
+					return
+				}
+
 				// Create video processing chain similar to RTP version
 				videoDemuxQueue, err := gst.NewElementWithProperties("queue", map[string]interface{}{
-					"name": fmt.Sprintf("videoDemuxQueue_%s_%s", pipelineID, padName),
+					"name": elementName,
 				})
 				if err != nil {
 					fmt.Printf("[%s] Failed to create video demux queue: %v\n", pipelineID, err)
+					return
+				}
+
+				// Print pad caps for debugging
+				padCaps := pad.GetCurrentCaps()
+				if padCaps != nil {
+					fmt.Printf("[%s] Video pad caps: %v\n", pipelineID, padCaps.String())
+				} else {
+					fmt.Printf("[%s] Video pad has no caps yet\n", pipelineID)
+				}
+
+				// 1. Add to pipeline
+				if err := gp.pipeline.Add(videoDemuxQueue); err != nil {
+					fmt.Printf("[%s] Failed to add videoDemuxQueue to pipeline: %v\n", pipelineID, err)
+					return
+				}
+				// 2. Set state to READY
+				if err := videoDemuxQueue.SetState(gst.StatePlaying); err != nil {
+					fmt.Printf("[%s] Failed to set videoDemuxQueue to PLAYING: %v\n", pipelineID, err)
 					return
 				}
 				videoDemuxQueue.SetProperty("max-size-buffers", 500)
@@ -667,6 +701,16 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 				}
 				videoInputCapsfilter.SetProperty("caps", gst.NewCapsFromString("video/x-h264"))
 
+				// Add videoInputCapsfilter to pipeline
+				if err := gp.pipeline.Add(videoInputCapsfilter); err != nil {
+					fmt.Printf("[%s] Failed to add videoInputCapsfilter to pipeline: %v\n", pipelineID, err)
+					return
+				}
+				if err := videoInputCapsfilter.SetState(gst.StatePlaying); err != nil {
+					fmt.Printf("[%s] Failed to set videoInputCapsfilter to PLAYING: %v\n", pipelineID, err)
+					return
+				}
+
 				videoH264parse, err := gst.NewElementWithProperties("h264parse", map[string]interface{}{
 					"name": fmt.Sprintf("videoH264parse_%s_%s", pipelineID, padName),
 				})
@@ -677,11 +721,31 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 				videoH264parse.SetProperty("config-interval", -1)
 				videoH264parse.SetProperty("disable-passthrough", false)
 				videoH264parse.SetProperty("update-timecode", true)
+
+				// Add videoH264parse to pipeline
+				if err := gp.pipeline.Add(videoH264parse); err != nil {
+					fmt.Printf("[%s] Failed to add videoH264parse to pipeline: %v\n", pipelineID, err)
+					return
+				}
+				if err := videoH264parse.SetState(gst.StatePlaying); err != nil {
+					fmt.Printf("[%s] Failed to set videoH264parse to PLAYING: %v\n", pipelineID, err)
+					return
+				}
+
 				videoParseQueue, err := gst.NewElementWithProperties("queue", map[string]interface{}{
 					"name": fmt.Sprintf("videoParseQueue_%s_%s", pipelineID, padName),
 				})
 				if err != nil {
 					fmt.Printf("[%s] Failed to create video parse queue: %v\n", pipelineID, err)
+					return
+				}
+				// Add videoParseQueue to pipeline
+				if err := gp.pipeline.Add(videoParseQueue); err != nil {
+					fmt.Printf("[%s] Failed to add videoParseQueue to pipeline: %v\n", pipelineID, err)
+					return
+				}
+				if err := videoParseQueue.SetState(gst.StatePlaying); err != nil {
+					fmt.Printf("[%s] Failed to set videoParseQueue to PLAYING: %v\n", pipelineID, err)
 					return
 				}
 				videoParseQueue.SetProperty("max-size-buffers", 100)
@@ -699,6 +763,16 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 				}
 				videoCapsfilter.SetProperty("caps", gst.NewCapsFromString("video/x-h264,alignment=au,stream-format=byte-stream"))
 
+				// Add videoCapsfilter to pipeline
+				if err := gp.pipeline.Add(videoCapsfilter); err != nil {
+					fmt.Printf("[%s] Failed to add videoCapsfilter to pipeline: %v\n", pipelineID, err)
+					return
+				}
+				if err := videoCapsfilter.SetState(gst.StatePlaying); err != nil {
+					fmt.Printf("[%s] Failed to set videoCapsfilter to PLAYING: %v\n", pipelineID, err)
+					return
+				}
+
 				videoOutputCapsfilter, err := gst.NewElementWithProperties("capsfilter", map[string]interface{}{
 					"name": fmt.Sprintf("videoOutputCapsfilter_%s_%s", pipelineID, padName),
 				})
@@ -707,6 +781,16 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 					return
 				}
 				videoOutputCapsfilter.SetProperty("caps", gst.NewCapsFromString("video/x-raw"))
+
+				// Add videoOutputCapsfilter to pipeline
+				if err := gp.pipeline.Add(videoOutputCapsfilter); err != nil {
+					fmt.Printf("[%s] Failed to add videoOutputCapsfilter to pipeline: %v\n", pipelineID, err)
+					return
+				}
+				if err := videoOutputCapsfilter.SetState(gst.StatePlaying); err != nil {
+					fmt.Printf("[%s] Failed to set videoOutputCapsfilter to PLAYING: %v\n", pipelineID, err)
+					return
+				}
 
 				videoDecoder, err := gst.NewElementWithProperties("avdec_h264", map[string]interface{}{
 					"name": fmt.Sprintf("videoDecoder_%s_%s", pipelineID, padName),
@@ -717,6 +801,16 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 				}
 				videoDecoder.SetProperty("sync", false)
 
+				// Add videoDecoder to pipeline
+				if err := gp.pipeline.Add(videoDecoder); err != nil {
+					fmt.Printf("[%s] Failed to add videoDecoder to pipeline: %v\n", pipelineID, err)
+					return
+				}
+				if err := videoDecoder.SetState(gst.StatePlaying); err != nil {
+					fmt.Printf("[%s] Failed to set videoDecoder to PLAYING: %v\n", pipelineID, err)
+					return
+				}
+
 				videoConvert, err := gst.NewElementWithProperties("videoconvert", map[string]interface{}{
 					"name": fmt.Sprintf("videoConvert_%s_%s", pipelineID, padName),
 				})
@@ -725,6 +819,16 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 					return
 				}
 				videoConvert.SetProperty("sync", false)
+
+				// Add videoConvert to pipeline
+				if err := gp.pipeline.Add(videoConvert); err != nil {
+					fmt.Printf("[%s] Failed to add videoConvert to pipeline: %v\n", pipelineID, err)
+					return
+				}
+				if err := videoConvert.SetState(gst.StatePlaying); err != nil {
+					fmt.Printf("[%s] Failed to set videoConvert to PLAYING: %v\n", pipelineID, err)
+					return
+				}
 
 				videoScale, err := gst.NewElementWithProperties("videoscale", map[string]interface{}{
 					"name": fmt.Sprintf("videoScale_%s_%s", pipelineID, padName),
@@ -735,15 +839,66 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 				}
 				videoScale.SetProperty("sync", false)
 				videoScale.SetProperty("method", 0)
-				// Link the video chain
-				if pad.Link(videoDemuxQueue.GetStaticPad("sink")) != gst.PadLinkOK {
-					fmt.Printf("[%s] Failed to link video pad to queue\n", pipelineID)
+
+				// Add videoScale to pipeline
+				if err := gp.pipeline.Add(videoScale); err != nil {
+					fmt.Printf("[%s] Failed to add videoScale to pipeline: %v\n", pipelineID, err)
+					return
+				}
+				if err := videoScale.SetState(gst.StatePlaying); err != nil {
+					fmt.Printf("[%s] Failed to set videoScale to PLAYING: %v\n", pipelineID, err)
+					return
+				}
+
+				// Link the video chain with better error handling
+				fmt.Printf("[%s] Starting video chain linking...\n", pipelineID)
+
+				// Link pad to videoDemuxQueue
+				sinkPad := videoDemuxQueue.GetStaticPad("sink")
+				if sinkPad == nil {
+					fmt.Printf("[%s] videoDemuxQueue sink pad is nil\n", pipelineID)
+					return
+				}
+
+				// Check if pad is already linked
+				if pad.IsLinked() {
+					fmt.Printf("[%s] Video pad %s is already linked, skipping\n", pipelineID, padName)
+					return
+				}
+
+				linkResult := pad.Link(sinkPad)
+				if linkResult != gst.PadLinkOK {
+					fmt.Printf("[%s] Failed to link video pad to queue: %v\n", pipelineID, linkResult)
+					fmt.Printf("[%s] Pad caps: %v\n", pipelineID, pad.GetCurrentCaps())
+					fmt.Printf("[%s] Sink pad caps: %v\n", pipelineID, sinkPad.GetCurrentCaps())
 					return
 				}
 				fmt.Printf("[%s] Successfully linked video pad to queue\n", pipelineID)
 
-				if videoDemuxQueue.GetStaticPad("src").Link(videoInputCapsfilter.GetStaticPad("sink")) != gst.PadLinkOK {
-					fmt.Printf("[%s] Failed to link queue to input capsfilter\n", pipelineID)
+				// Before linking, check for nil and already-linked pads, and print caps if linking fails
+				srcPad := videoDemuxQueue.GetStaticPad("src")
+				sinkPad = videoInputCapsfilter.GetStaticPad("sink")
+				if srcPad == nil {
+					fmt.Printf("[%s] videoDemuxQueue src pad is nil\n", pipelineID)
+					return
+				}
+				if sinkPad == nil {
+					fmt.Printf("[%s] videoInputCapsfilter sink pad is nil\n", pipelineID)
+					return
+				}
+				if srcPad.IsLinked() {
+					fmt.Printf("[%s] videoDemuxQueue src pad is already linked\n", pipelineID)
+					return
+				}
+				if sinkPad.IsLinked() {
+					fmt.Printf("[%s] videoInputCapsfilter sink pad is already linked\n", pipelineID)
+					return
+				}
+				linkResult = srcPad.Link(sinkPad)
+				if linkResult != gst.PadLinkOK {
+					fmt.Printf("[%s] Failed to link queue to input capsfilter: %v\n", pipelineID, linkResult)
+					fmt.Printf("[%s] queue src pad caps: %v\n", pipelineID, srcPad.GetCurrentCaps())
+					fmt.Printf("[%s] capsfilter sink pad caps: %v\n", pipelineID, sinkPad.GetCurrentCaps())
 					return
 				}
 				fmt.Printf("[%s] Successfully linked queue to input capsfilter\n", pipelineID)
@@ -850,6 +1005,7 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 					fmt.Printf("[%s] Failed to create audio demux queue: %v\n", pipelineID, err)
 					return
 				}
+				// Set properties before adding to pipeline
 				audioDemuxQueue.SetProperty("max-size-buffers", 1500)
 				audioDemuxQueue.SetProperty("max-size-time", uint64(2500*1000000))
 				audioDemuxQueue.SetProperty("min-threshold-time", uint64(800*1000000))
@@ -857,6 +1013,16 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 				audioDemuxQueue.SetProperty("leaky", 0)
 				audioDemuxQueue.SetProperty("max-size-bytes", 0)
 				audioDemuxQueue.SetProperty("silent", false)
+
+				// Add audioDemuxQueue to pipeline
+				if err := gp.pipeline.Add(audioDemuxQueue); err != nil {
+					fmt.Printf("[%s] Failed to add audioDemuxQueue to pipeline: %v\n", pipelineID, err)
+					return
+				}
+				if err := audioDemuxQueue.SetState(gst.StatePlaying); err != nil {
+					fmt.Printf("[%s] Failed to set audioDemuxQueue to PLAYING: %v\n", pipelineID, err)
+					return
+				}
 
 				audioAacparse, err := gst.NewElementWithProperties("aacparse", map[string]interface{}{
 					"name": fmt.Sprintf("audioAacparse_%s_%s", pipelineID, padName),
@@ -867,6 +1033,16 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 				}
 				audioAacparse.SetProperty("sync", false)
 
+				// Add audioAacparse to pipeline
+				if err := gp.pipeline.Add(audioAacparse); err != nil {
+					fmt.Printf("[%s] Failed to add audioAacparse to pipeline: %v\n", pipelineID, err)
+					return
+				}
+				if err := audioAacparse.SetState(gst.StatePlaying); err != nil {
+					fmt.Printf("[%s] Failed to set audioAacparse to PLAYING: %v\n", pipelineID, err)
+					return
+				}
+
 				audioDecoder, err := gst.NewElementWithProperties("avdec_aac", map[string]interface{}{
 					"name": fmt.Sprintf("audioDecoder_%s_%s", pipelineID, padName),
 				})
@@ -876,6 +1052,16 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 				}
 				audioDecoder.SetProperty("sync", false)
 
+				// Add audioDecoder to pipeline
+				if err := gp.pipeline.Add(audioDecoder); err != nil {
+					fmt.Printf("[%s] Failed to add audioDecoder to pipeline: %v\n", pipelineID, err)
+					return
+				}
+				if err := audioDecoder.SetState(gst.StatePlaying); err != nil {
+					fmt.Printf("[%s] Failed to set audioDecoder to PLAYING: %v\n", pipelineID, err)
+					return
+				}
+
 				audioConvert, err := gst.NewElementWithProperties("audioconvert", map[string]interface{}{
 					"name": fmt.Sprintf("audioConvert_%s_%s", pipelineID, padName),
 				})
@@ -884,6 +1070,16 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 					return
 				}
 				audioConvert.SetProperty("sync", false)
+
+				// Add audioConvert to pipeline
+				if err := gp.pipeline.Add(audioConvert); err != nil {
+					fmt.Printf("[%s] Failed to add audioConvert to pipeline: %v\n", pipelineID, err)
+					return
+				}
+				if err := audioConvert.SetState(gst.StatePlaying); err != nil {
+					fmt.Printf("[%s] Failed to set audioConvert to PLAYING: %v\n", pipelineID, err)
+					return
+				}
 
 				audioResample, err := gst.NewElementWithProperties("audioresample", map[string]interface{}{
 					"name": fmt.Sprintf("audioResample_%s_%s", pipelineID, padName),
@@ -895,6 +1091,16 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 				audioResample.SetProperty("sync", false)
 				audioResample.SetProperty("quality", 10)
 
+				// Add audioResample to pipeline
+				if err := gp.pipeline.Add(audioResample); err != nil {
+					fmt.Printf("[%s] Failed to add audioResample to pipeline: %v\n", pipelineID, err)
+					return
+				}
+				if err := audioResample.SetState(gst.StatePlaying); err != nil {
+					fmt.Printf("[%s] Failed to set audioResample to PLAYING: %v\n", pipelineID, err)
+					return
+				}
+
 				audioCapsfilter, err := gst.NewElementWithProperties("capsfilter", map[string]interface{}{
 					"name": fmt.Sprintf("audioCapsfilter_%s_%s", pipelineID, padName),
 				})
@@ -904,20 +1110,14 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 				}
 				audioCapsfilter.SetProperty("caps", gst.NewCapsFromString("audio/x-raw,format=S16LE,rate=48000,channels=2,layout=interleaved"))
 
-				// Add audio elements to pipeline
-				audioElements := []*gst.Element{
-					audioDemuxQueue, audioAacparse, audioDecoder, audioConvert, audioResample, audioCapsfilter,
+				// Add audioCapsfilter to pipeline
+				if err := gp.pipeline.Add(audioCapsfilter); err != nil {
+					fmt.Printf("[%s] Failed to add audioCapsfilter to pipeline: %v\n", pipelineID, err)
+					return
 				}
-
-				for _, element := range audioElements {
-					if err := gp.pipeline.Add(element); err != nil {
-						fmt.Printf("[%s] Failed to add audio element to pipeline: %v\n", pipelineID, err)
-						return
-					}
-					if err := element.SetState(gst.StatePlaying); err != nil {
-						fmt.Printf("[%s] Failed to set audio element state: %v\n", pipelineID, err)
-						return
-					}
+				if err := audioCapsfilter.SetState(gst.StatePlaying); err != nil {
+					fmt.Printf("[%s] Failed to set audioCapsfilter to PLAYING: %v\n", pipelineID, err)
+					return
 				}
 
 				// Link the audio chain
