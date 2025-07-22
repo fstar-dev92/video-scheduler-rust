@@ -76,8 +76,8 @@ type HLSGStreamerPipeline struct {
 	pipelineID     string      // Add this field
 }
 
-// NewHLSGStreamerPipeline creates a new GStreamer pipeline for HLS processing with videomixer and audio mixer
-func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, assetVideoPath string) (*HLSGStreamerPipeline, error) {
+// NewHLSGStreamerPipeline creates a new GStreamer pipeline for HLS or SRT processing with videomixer and audio mixer
+func NewHLSGStreamerPipeline(inputType string, inputUrl string, outputHost string, outputPort int, assetVideoPath string) (*HLSGStreamerPipeline, error) {
 	// Generate a unique pipeline ID
 	pipelineID := fmt.Sprintf("pipeline_%d", time.Now().UnixNano())
 
@@ -100,30 +100,68 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 		pipelineID:     pipelineID,
 	}
 
-	// Create HLS source element
-	hlsSrc, err := gst.NewElementWithProperties("souphttpsrc", map[string]interface{}{
-		"name": fmt.Sprintf("hlsSrc_%s", pipelineID),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create hls source: %v", err)
+	var srcElement *gst.Element
+	var demuxElement *gst.Element
+
+	if inputType == "srt" {
+		srcElement, err = gst.NewElementWithProperties("srtsrc", map[string]interface{}{
+			"uri":                 inputUrl,
+			"latency":             200,
+			"timeout":             uint64(10 * 1000000000),
+			"wait-for-connection": true,
+			"do-timestamp":        true,
+			"name":                fmt.Sprintf("srtSrc_%s", pipelineID),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to create SRT source: %v", err)
+		}
+		demuxElement, err = gst.NewElementWithProperties("tsdemux", map[string]interface{}{
+			"name":               fmt.Sprintf("tsdemux_%s", pipelineID),
+			"send-scte35-events": true,
+			"latency":            1000,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to create tsdemux: %v", err)
+		}
+	} else {
+		srcElement, err = gst.NewElementWithProperties("souphttpsrc", map[string]interface{}{
+			"name": fmt.Sprintf("hlsSrc_%s", pipelineID),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to create hls source: %v", err)
+		}
+		demuxElement, err = gst.NewElementWithProperties("hlsdemux", map[string]interface{}{
+			"name": fmt.Sprintf("hlsDemux_%s", pipelineID),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to create hls demuxer: %v", err)
+		}
 	}
 
-	// Create HLS demuxer
-	hlsDemux, err := gst.NewElementWithProperties("hlsdemux", map[string]interface{}{
-		"name": fmt.Sprintf("hlsDemux_%s", pipelineID),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create hls demuxer: %v", err)
+	// Add src and demux to pipeline
+	if err := pipeline.Add(srcElement); err != nil {
+		return nil, fmt.Errorf("failed to add srcElement to pipeline: %v", err)
+	}
+	if err := pipeline.Add(demuxElement); err != nil {
+		return nil, fmt.Errorf("failed to add demuxElement to pipeline: %v", err)
 	}
 
-	// Create tsdemux for MPEG-TS streams from HLS
-	tsdemux, err := gst.NewElementWithProperties("tsdemux", map[string]interface{}{
-		"name":               fmt.Sprintf("tsdemux_%s", pipelineID),
-		"send-scte35-events": true,
-		"latency":            1000,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create tsdemux: %v", err)
+	// Link src to demux
+	if err := srcElement.Link(demuxElement); err != nil {
+		return nil, fmt.Errorf("failed to link srcElement to demuxElement: %v", err)
+	}
+
+	// Create the pipeline instance
+	gp = &HLSGStreamerPipeline{
+		pipeline:       pipeline,
+		assetVideoPath: assetVideoPath,
+		currentInput:   "hls",
+		assetPlaying:   false,
+		stopChan:       make(chan struct{}),
+		running:        false,
+		hlsConnected:   false,
+		hlsTimeout:     time.NewTimer(30 * time.Second),
+		pipelineID:     pipelineID,
 	}
 
 	// Create intervideosink for HLS stream (input1)
@@ -494,25 +532,25 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 	}
 
 	// Set HLS source properties
-	hlsSrc.SetProperty("location", hlsUrl)
-	hlsSrc.SetProperty("timeout", uint64(10*1000000000)) // 10 second timeout
-	hlsSrc.SetProperty("retries", 3)                     // Retry 3 times
-	hlsSrc.SetProperty("user-id", "")
-	hlsSrc.SetProperty("user-pw", "")
-	hlsSrc.SetProperty("do-timestamp", true)
-	hlsSrc.SetProperty("http-log-level", 3)
+	srcElement.SetProperty("location", inputUrl)
+	srcElement.SetProperty("timeout", uint64(10*1000000000)) // 10 second timeout
+	srcElement.SetProperty("retries", 3)                     // Retry 3 times
+	srcElement.SetProperty("user-id", "")
+	srcElement.SetProperty("user-pw", "")
+	srcElement.SetProperty("do-timestamp", true)
+	srcElement.SetProperty("http-log-level", 3)
 	// Configure HLS demuxer for seamless playback
-	hlsDemux.SetProperty("timeout", uint64(5*1000000000)) // Reduced to 5 second timeout
-	hlsDemux.SetProperty("max-errors", 5)                 // Increased max errors
-	hlsDemux.SetProperty("async", false)
-	hlsDemux.SetProperty("sync", false)
+	demuxElement.SetProperty("timeout", uint64(5*1000000000)) // Reduced to 5 second timeout
+	demuxElement.SetProperty("max-errors", 5)                 // Increased max errors
+	demuxElement.SetProperty("async", false)
+	demuxElement.SetProperty("sync", false)
 	// Add segment handling optimizations
-	hlsDemux.SetProperty("segment-duration", uint64(2*1000000000)) // 2 second segments
-	hlsDemux.SetProperty("segment-start-time", int64(0))
-	hlsDemux.SetProperty("segment-stop-time", int64(-1)) // -1 means until end
-	hlsDemux.SetProperty("segment-repeat", 0)            // No repeat
-	hlsDemux.SetProperty("segment-offset", int64(0))
-	hlsDemux.SetProperty("segment-trickmode-interval", uint64(0)) // No trick mode
+	demuxElement.SetProperty("segment-duration", uint64(2*1000000000)) // 2 second segments
+	demuxElement.SetProperty("segment-start-time", int64(0))
+	demuxElement.SetProperty("segment-stop-time", int64(-1)) // -1 means until end
+	demuxElement.SetProperty("segment-repeat", 0)            // No repeat
+	demuxElement.SetProperty("segment-offset", int64(0))
+	demuxElement.SetProperty("segment-trickmode-interval", uint64(0)) // No trick mode
 
 	// Configure pipeline latency
 	pipeline.SetProperty("latency", int64(200*1000000)) // Reduced from 500ms to 200ms for lower latency
@@ -556,7 +594,7 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 
 	// Add elements to pipeline
 	elements := []*gst.Element{
-		hlsSrc, hlsDemux, tsdemux,
+		srcElement, demuxElement, demuxElement,
 		intervideosink1, interaudiosink1,
 		intervideo1, intervideo2, videomixer,
 		interaudio1, interaudio2, audiomixer,
@@ -575,8 +613,8 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 	}
 
 	// Link elements (except demuxers which need dynamic linking)
-	if err := hlsSrc.Link(hlsDemux); err != nil {
-		return nil, fmt.Errorf("failed to link hlsSrc to hlsDemux: %v", err)
+	if err := srcElement.Link(demuxElement); err != nil {
+		return nil, fmt.Errorf("failed to link srcElement to demuxElement: %v", err)
 	}
 
 	// Link video elements directly
@@ -691,7 +729,7 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 		return nil, fmt.Errorf("failed to link rtpbin send_rtp_src_0 to udpsink")
 	}
 
-	hlsDemux.Connect("pad-added", func(self *gst.Element, pad *gst.Pad) {
+	demuxElement.Connect("pad-added", func(self *gst.Element, pad *gst.Pad) {
 		fmt.Printf("[%s] HLS demuxer pad added: %s\n", pipelineID, pad.GetName())
 
 		// Check if pad is already linked
@@ -713,7 +751,7 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 			time.Sleep(50 * time.Millisecond) // Reduced from 100ms to 50ms for faster segment transitions
 
 			// Link HLS demuxer output to tsdemux
-			tsdemuxSinkPad := tsdemux.GetStaticPad("sink")
+			tsdemuxSinkPad := demuxElement.GetStaticPad("sink")
 			if tsdemuxSinkPad == nil {
 				fmt.Printf("[%s] TS demuxer sink pad is nil\n", pipelineID)
 				return
@@ -726,7 +764,7 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 			}
 
 			// Check TS demuxer state
-			tsdemuxState := tsdemux.GetCurrentState()
+			tsdemuxState := demuxElement.GetCurrentState()
 			fmt.Printf("[%s] TS demuxer state before linking: %s\n", pipelineID, tsdemuxState.String())
 
 			linkResult := pad.Link(tsdemuxSinkPad)
@@ -738,7 +776,7 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 				// Try to set TS demuxer to PLAYING state and retry
 				if tsdemuxState != gst.StatePlaying {
 					fmt.Printf("[%s] Setting TS demuxer to PLAYING state and retrying...\n", pipelineID)
-					if err := tsdemux.SetState(gst.StatePlaying); err != nil {
+					if err := demuxElement.SetState(gst.StatePlaying); err != nil {
 						fmt.Printf("[%s] Failed to set TS demuxer to PLAYING: %v\n", pipelineID, err)
 						return
 					}
@@ -758,7 +796,7 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 	})
 
 	// Set up dynamic pad-added signal for tsdemux
-	tsdemux.Connect("pad-added", func(self *gst.Element, pad *gst.Pad) {
+	demuxElement.Connect("pad-added", func(self *gst.Element, pad *gst.Pad) {
 		fmt.Printf("[%s] ##############################################\n", pipelineID)
 
 		go func() {
@@ -1362,11 +1400,11 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 				if newState == gst.StatePaused && oldState == gst.StateReady {
 					fmt.Printf("[%s] Pipeline stuck in PAUSED state - likely no HLS data received\n", pipelineID)
 					// Add more debugging for HLS source
-					if hlsSrc != nil {
-						fmt.Printf("[%s] HLS source state: %s\n", pipelineID, hlsSrc.GetCurrentState().String())
+					if srcElement != nil {
+						fmt.Printf("[%s] HLS source state: %s\n", pipelineID, srcElement.GetCurrentState().String())
 					}
-					if hlsDemux != nil {
-						fmt.Printf("[%s] HLS demuxer state: %s\n", pipelineID, hlsDemux.GetCurrentState().String())
+					if demuxElement != nil {
+						fmt.Printf("[%s] HLS demuxer state: %s\n", pipelineID, demuxElement.GetCurrentState().String())
 					}
 					// go func() {
 					// 	time.Sleep(5 * time.Second)
@@ -1380,14 +1418,14 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 				if newState == gst.StatePaused && oldState == gst.StatePlaying {
 					fmt.Printf("[%s] Pipeline went from PLAYING to PAUSED - checking for HLS data issues\n", pipelineID)
 					// Add debugging for element states
-					if hlsSrc != nil {
-						fmt.Printf("[%s] HLS source state: %s\n", pipelineID, hlsSrc.GetCurrentState().String())
+					if srcElement != nil {
+						fmt.Printf("[%s] HLS source state: %s\n", pipelineID, srcElement.GetCurrentState().String())
 					}
-					if hlsDemux != nil {
-						fmt.Printf("[%s] HLS demuxer state: %s\n", pipelineID, hlsDemux.GetCurrentState().String())
+					if demuxElement != nil {
+						fmt.Printf("[%s] HLS demuxer state: %s\n", pipelineID, demuxElement.GetCurrentState().String())
 					}
-					if tsdemux != nil {
-						fmt.Printf("[%s] TS demuxer state: %s\n", pipelineID, tsdemux.GetCurrentState().String())
+					if demuxElement != nil {
+						fmt.Printf("[%s] TS demuxer state: %s\n", pipelineID, demuxElement.GetCurrentState().String())
 					}
 					// go func() {
 					// 	time.Sleep(2 * time.Second)
@@ -1413,13 +1451,13 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 					fmt.Printf("[%s] Pipeline running status: %v\n", pipelineID, gp.running)
 
 					// Check HLS source and demuxer states
-					if hlsSrc != nil {
-						hlsSrcState := hlsSrc.GetCurrentState()
-						fmt.Printf("[%s] HLS source state: %s\n", pipelineID, hlsSrcState.String())
+					if srcElement != nil {
+						srcState := srcElement.GetCurrentState()
+						fmt.Printf("[%s] HLS source state: %s\n", pipelineID, srcState.String())
 					}
-					if hlsDemux != nil {
-						hlsDemuxState := hlsDemux.GetCurrentState()
-						fmt.Printf("[%s] HLS demuxer state: %s\n", pipelineID, hlsDemuxState.String())
+					if demuxElement != nil {
+						demuxState := demuxElement.GetCurrentState()
+						fmt.Printf("[%s] HLS demuxer state: %s\n", pipelineID, demuxState.String())
 					}
 
 					// go func() {
@@ -1435,14 +1473,14 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 				} else {
 					// For other errors, try to get more context
 					fmt.Printf("[%s] Unknown pipeline error, checking element states...\n", pipelineID)
-					if hlsSrc != nil {
-						fmt.Printf("[%s] HLS source state: %s\n", pipelineID, hlsSrc.GetCurrentState().String())
+					if srcElement != nil {
+						fmt.Printf("[%s] HLS source state: %s\n", pipelineID, srcElement.GetCurrentState().String())
 					}
-					if hlsDemux != nil {
-						fmt.Printf("[%s] HLS demuxer state: %s\n", pipelineID, hlsDemux.GetCurrentState().String())
+					if demuxElement != nil {
+						fmt.Printf("[%s] HLS demuxer state: %s\n", pipelineID, demuxElement.GetCurrentState().String())
 					}
-					if tsdemux != nil {
-						fmt.Printf("[%s] TS demuxer state: %s\n", pipelineID, tsdemux.GetCurrentState().String())
+					if demuxElement != nil {
+						fmt.Printf("[%s] TS demuxer state: %s\n", pipelineID, demuxElement.GetCurrentState().String())
 					}
 				}
 			case gst.MessageWarning:
@@ -1479,7 +1517,7 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 	}()
 
 	// Assign elements to the pipeline instance
-	gp.demux = tsdemux
+	gp.demux = demuxElement
 	gp.mux = mpegtsmux
 	gp.videomixer = videomixer
 	gp.audiomixer = audiomixer
@@ -1817,7 +1855,7 @@ func (gp *HLSGStreamerPipeline) Stop() {
 func RunHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, assetVideoPath string) error {
 	fmt.Printf("Starting HLS GStreamer pipeline: %s -> %s:%d with asset: %s\n", hlsUrl, outputHost, outputPort, assetVideoPath)
 
-	pipeline, err := NewHLSGStreamerPipeline(hlsUrl, outputHost, outputPort, assetVideoPath)
+	pipeline, err := NewHLSGStreamerPipeline("hls", hlsUrl, outputHost, outputPort, assetVideoPath)
 	if err != nil {
 		return fmt.Errorf("failed to create pipeline: %v", err)
 	}
