@@ -208,10 +208,15 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 		return nil, fmt.Errorf("failed to create audiomixer: %v", err)
 	}
 
-	// Audio mixer settings
-	audiomixer.SetProperty("latency", int64(100*1000000))
+	// Audio mixer settings optimized for seamless audio
+	audiomixer.SetProperty("latency", int64(200*1000000)) // Reduced from 100ms to 200ms for better sync
 	audiomixer.SetProperty("silent", false)
 	audiomixer.SetProperty("resampler", "audioconvert")
+	// Add audio sync properties to prevent cutting
+	audiomixer.SetProperty("sync", true)
+	audiomixer.SetProperty("async", false)
+	audiomixer.SetProperty("max-lateness", int64(50*1000000)) // 50ms max lateness
+	audiomixer.SetProperty("qos", true)
 
 	// Create volume control for HLS audio (input1)
 	hlsVolume, err := gst.NewElementWithProperties("volume", map[string]interface{}{
@@ -324,12 +329,12 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 	if err != nil {
 		return nil, fmt.Errorf("failed to create audio queue 1: %v", err)
 	}
-	// Optimize for seamless HLS playback
-	audioQueue1.SetProperty("max-size-buffers", 500)                   // Reduced from 1000
-	audioQueue1.SetProperty("max-size-time", uint64(1000*1000000))     // Reduced from 2000ms to 1000ms
-	audioQueue1.SetProperty("min-threshold-time", uint64(200*1000000)) // Reduced from 500ms to 200ms
-	audioQueue1.SetProperty("sync", false)
-	audioQueue1.SetProperty("leaky", 2) // Leak downstream (newer frames)
+	// Optimize for seamless HLS playback and prevent audio cutting
+	audioQueue1.SetProperty("max-size-buffers", 2000)                  // Increased from 500 to prevent underruns
+	audioQueue1.SetProperty("max-size-time", uint64(3000*1000000))     // Increased from 1000ms to 3000ms
+	audioQueue1.SetProperty("min-threshold-time", uint64(500*1000000)) // Increased from 200ms to 500ms
+	audioQueue1.SetProperty("sync", true)                              // Enable sync for audio
+	audioQueue1.SetProperty("leaky", 0)                                // Don't leak audio frames
 	audioQueue1.SetProperty("max-size-bytes", 0)
 	audioQueue1.SetProperty("silent", false)
 
@@ -340,12 +345,12 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 	if err != nil {
 		return nil, fmt.Errorf("failed to create audio queue 2: %v", err)
 	}
-	// Optimize for seamless HLS playback
-	audioQueue2.SetProperty("max-size-buffers", 500)                   // Reduced from 1000
-	audioQueue2.SetProperty("max-size-time", uint64(1000*1000000))     // Reduced from 2000ms to 1000ms
-	audioQueue2.SetProperty("min-threshold-time", uint64(200*1000000)) // Reduced from 500ms to 200ms
-	audioQueue2.SetProperty("sync", false)
-	audioQueue2.SetProperty("leaky", 2) // Leak downstream (newer frames)
+	// Optimize for seamless HLS playback and prevent audio cutting
+	audioQueue2.SetProperty("max-size-buffers", 2000)                  // Increased from 500 to prevent underruns
+	audioQueue2.SetProperty("max-size-time", uint64(3000*1000000))     // Increased from 1000ms to 3000ms
+	audioQueue2.SetProperty("min-threshold-time", uint64(500*1000000)) // Increased from 200ms to 500ms
+	audioQueue2.SetProperty("sync", true)                              // Enable sync for audio
+	audioQueue2.SetProperty("leaky", 0)                                // Don't leak audio frames
 	audioQueue2.SetProperty("max-size-bytes", 0)
 	audioQueue2.SetProperty("silent", false)
 
@@ -356,6 +361,7 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 	if err != nil {
 		return nil, fmt.Errorf("failed to create aacparse1: %v", err)
 	}
+	aacparse1.SetProperty("sync", true) // Enable sync for audio parsing
 
 	audioconvert, err := gst.NewElementWithProperties("audioconvert", map[string]interface{}{
 		"name": fmt.Sprintf("audioconvert_%s", pipelineID),
@@ -363,6 +369,7 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 	if err != nil {
 		return nil, fmt.Errorf("failed to create audioconvert: %v", err)
 	}
+	audioconvert.SetProperty("sync", true) // Enable sync for audio conversion
 
 	audioresample, err := gst.NewElementWithProperties("audioresample", map[string]interface{}{
 		"name": fmt.Sprintf("audioresample_%s", pipelineID),
@@ -370,6 +377,7 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 	if err != nil {
 		return nil, fmt.Errorf("failed to create audioresample: %v", err)
 	}
+	audioresample.SetProperty("sync", true) // Enable sync for audio resampling
 
 	voaacenc, err := gst.NewElementWithProperties("avenc_aac", map[string]interface{}{
 		"name": fmt.Sprintf("voaacenc_%s", pipelineID),
@@ -377,6 +385,7 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 	if err != nil {
 		return nil, fmt.Errorf("failed to create voaacenc: %v", err)
 	}
+	voaacenc.SetProperty("sync", true) // Enable sync for audio encoding
 
 	aacparse2, err := gst.NewElementWithProperties("aacparse", map[string]interface{}{
 		"name": fmt.Sprintf("aacparse2_%s", pipelineID),
@@ -384,6 +393,7 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 	if err != nil {
 		return nil, fmt.Errorf("failed to create aacparse2: %v", err)
 	}
+	aacparse2.SetProperty("sync", true) // Enable sync for audio parsing
 
 	// Audio queue before muxer
 	audioMuxerQueue, err := gst.NewElementWithProperties("queue", map[string]interface{}{
@@ -392,11 +402,12 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 	if err != nil {
 		return nil, fmt.Errorf("failed to create audio muxer queue: %v", err)
 	}
-	audioMuxerQueue.SetProperty("max-size-buffers", 2000)
-	audioMuxerQueue.SetProperty("max-size-time", uint64(3000*1000000))
-	audioMuxerQueue.SetProperty("min-threshold-time", uint64(1000*1000000))
-	audioMuxerQueue.SetProperty("sync", false)
-	audioMuxerQueue.SetProperty("leaky", 0)
+	// Optimize for seamless audio and prevent cutting
+	audioMuxerQueue.SetProperty("max-size-buffers", 4000)                   // Increased from 2000 to prevent underruns
+	audioMuxerQueue.SetProperty("max-size-time", uint64(5000*1000000))      // Increased from 3000ms to 5000ms
+	audioMuxerQueue.SetProperty("min-threshold-time", uint64(1000*1000000)) // Increased from 1000ms to 1000ms
+	audioMuxerQueue.SetProperty("sync", true)                               // Enable sync for audio
+	audioMuxerQueue.SetProperty("leaky", 0)                                 // Don't leak audio frames
 	audioMuxerQueue.SetProperty("max-size-bytes", 0)
 	audioMuxerQueue.SetProperty("silent", false)
 
@@ -416,7 +427,7 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 	}
 
 	rtpbin, err := gst.NewElementWithProperties("rtpbin", map[string]interface{}{
-		"latency":                uint(400),
+		"latency":                uint(200), // Reduced from 400ms to 200ms for lower latency
 		"do-retransmission":      true,
 		"rtp-profile":            2,
 		"ntp-sync":               true,
@@ -436,11 +447,11 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 	udpsink, err := gst.NewElementWithProperties("udpsink", map[string]interface{}{
 		"host":           outputHost,
 		"port":           outputPort,
-		"sync":           false,
-		"buffer-size":    524288,
+		"sync":           false,   // Keep false for UDP output
+		"buffer-size":    1048576, // Increased from 524288 to 1MB for better buffering
 		"auto-multicast": true,
 		"name":           fmt.Sprintf("udpsink_%s", pipelineID),
-		"async":          false,
+		"async":          false, // Disable async for more reliable output
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create udpsink: %v", err)
@@ -449,16 +460,11 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 	// Set HLS source properties
 	hlsSrc.SetProperty("location", hlsUrl)
 	hlsSrc.SetProperty("timeout", uint64(10*1000000000)) // 10 second timeout
-	hlsSrc.SetProperty("retry", 3)                       // Retry 3 times
+	hlsSrc.SetProperty("retries", 3)                     // Retry 3 times
 	hlsSrc.SetProperty("user-id", "")
 	hlsSrc.SetProperty("user-pw", "")
-	// Add HLS-specific optimizations for seamless playback
-	hlsSrc.SetProperty("async", false)
-	hlsSrc.SetProperty("sync", false)
-	hlsSrc.SetProperty("max-errors", 5)
-	hlsSrc.SetProperty("max-connect-timeout", uint64(5*1000000000))    // 5 second connect timeout
-	hlsSrc.SetProperty("max-connection-timeout", uint64(5*1000000000)) // 5 second connection timeout
-
+	hlsSrc.SetProperty("do-timestamp", true)
+	hlsSrc.SetProperty("http-log-level", 3)
 	// Configure HLS demuxer for seamless playback
 	hlsDemux.SetProperty("timeout", uint64(5*1000000000)) // Reduced to 5 second timeout
 	hlsDemux.SetProperty("max-errors", 5)                 // Increased max errors
@@ -482,8 +488,12 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 	x264enc.SetProperty("ref", 1)                    // Single reference frame for lower latency
 
 	// Audio encoder properties
-	voaacenc.SetProperty("bitrate", 128000)
+	voaacenc.SetProperty("bitrate", 192000) // Increased from 128000 for better audio quality
 	voaacenc.SetProperty("channels", 2)
+	// Add audio encoder optimizations to prevent cutting
+	voaacenc.SetProperty("quality", 2)        // High quality encoding
+	voaacenc.SetProperty("profile", 2)        // AAC-LC profile for better compatibility
+	voaacenc.SetProperty("afterburner", true) // Enable afterburner for better quality
 
 	// Audio resampler properties
 	audioresample.SetProperty("quality", 10)
@@ -1088,12 +1098,12 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 					fmt.Printf("[%s] Failed to create audio demux queue: %v\n", pipelineID, err)
 					return
 				}
-				// Optimize for seamless HLS segment transitions
-				audioDemuxQueue.SetProperty("max-size-buffers", 750)                   // Reduced from 1500
-				audioDemuxQueue.SetProperty("max-size-time", uint64(1500*1000000))     // Reduced from 2500ms to 1500ms
-				audioDemuxQueue.SetProperty("min-threshold-time", uint64(300*1000000)) // Reduced from 800ms to 300ms
-				audioDemuxQueue.SetProperty("sync", false)
-				audioDemuxQueue.SetProperty("leaky", 2) // Leak downstream (newer frames)
+				// Optimize for seamless HLS segment transitions and prevent audio cutting
+				audioDemuxQueue.SetProperty("max-size-buffers", 1500)                  // Increased from 750 to prevent underruns
+				audioDemuxQueue.SetProperty("max-size-time", uint64(2500*1000000))     // Increased from 1500ms to 2500ms
+				audioDemuxQueue.SetProperty("min-threshold-time", uint64(500*1000000)) // Increased from 300ms to 500ms
+				audioDemuxQueue.SetProperty("sync", true)                              // Enable sync for audio
+				audioDemuxQueue.SetProperty("leaky", 0)                                // Don't leak audio frames
 				audioDemuxQueue.SetProperty("max-size-bytes", 0)
 				audioDemuxQueue.SetProperty("silent", false)
 
