@@ -236,6 +236,42 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 	}
 	assetVolume.SetProperty("volume", 0.0)
 
+	// Create audio format converters for dynamic audio formats
+	hlsAudioConvert, err := gst.NewElementWithProperties("audioconvert", map[string]interface{}{
+		"name": fmt.Sprintf("hlsAudioConvert_%s", pipelineID),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create HLS audio convert: %v", err)
+	}
+	hlsAudioConvert.SetProperty("sync", true)
+
+	assetAudioConvert, err := gst.NewElementWithProperties("audioconvert", map[string]interface{}{
+		"name": fmt.Sprintf("assetAudioConvert_%s", pipelineID),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create asset audio convert: %v", err)
+	}
+	assetAudioConvert.SetProperty("sync", true)
+
+	// Create audio capsfilters to ensure compatible formats
+	hlsAudioCapsfilter, err := gst.NewElementWithProperties("capsfilter", map[string]interface{}{
+		"name": fmt.Sprintf("hlsAudioCapsfilter_%s", pipelineID),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create HLS audio capsfilter: %v", err)
+	}
+	// Set flexible audio caps that can handle various formats
+	hlsAudioCapsfilter.SetProperty("caps", gst.NewCapsFromString("audio/x-raw,format={S16LE,S32LE,F32LE},layout=interleaved,rate={44100,48000},channels={1,2}"))
+
+	assetAudioCapsfilter, err := gst.NewElementWithProperties("capsfilter", map[string]interface{}{
+		"name": fmt.Sprintf("assetAudioCapsfilter_%s", pipelineID),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create asset audio capsfilter: %v", err)
+	}
+	// Set flexible audio caps that can handle various formats
+	assetAudioCapsfilter.SetProperty("caps", gst.NewCapsFromString("audio/x-raw,format={S16LE,S32LE,F32LE},layout=interleaved,rate={44100,48000},channels={1,2}"))
+
 	// Create video processing elements for HLS stream (input1)
 	videoQueue1, err := gst.NewElementWithProperties("queue", map[string]interface{}{
 		"name": fmt.Sprintf("videoQueue1_%s", pipelineID),
@@ -525,6 +561,7 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 		intervideo1, intervideo2, videomixer,
 		interaudio1, interaudio2, audiomixer,
 		hlsVolume, assetVolume,
+		hlsAudioConvert, assetAudioConvert, hlsAudioCapsfilter, assetAudioCapsfilter,
 		videoQueue1, videoQueue2, videoconvert, videomixerCapsfilter, videomixerOutputCapsfilter, x264enc, h264parse2, videoMuxerQueue,
 		audioQueue1, audioQueue2, aacparse1, audioconvert, audioresample, voaacenc, aacparse2,
 		audioMuxerQueue, mpegtsmux, rtpmp2tpay,
@@ -584,15 +621,27 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 		return nil, fmt.Errorf("failed to link interaudio2 to audioQueue2: %v", err)
 	}
 
-	// Link audio processing chain with volume controls
-	if err := audioQueue1.Link(hlsVolume); err != nil {
-		return nil, fmt.Errorf("failed to link audioQueue1 to hlsVolume: %v", err)
+	// Link audio processing chain with volume controls and format conversion
+	if err := audioQueue1.Link(hlsAudioConvert); err != nil {
+		return nil, fmt.Errorf("failed to link audioQueue1 to hlsAudioConvert: %v", err)
+	}
+	if err := hlsAudioConvert.Link(hlsAudioCapsfilter); err != nil {
+		return nil, fmt.Errorf("failed to link hlsAudioConvert to hlsAudioCapsfilter: %v", err)
+	}
+	if err := hlsAudioCapsfilter.Link(hlsVolume); err != nil {
+		return nil, fmt.Errorf("failed to link hlsAudioCapsfilter to hlsVolume: %v", err)
 	}
 	if err := hlsVolume.Link(audiomixer); err != nil {
 		return nil, fmt.Errorf("failed to link hlsVolume to audiomixer: %v", err)
 	}
-	if err := audioQueue2.Link(assetVolume); err != nil {
-		return nil, fmt.Errorf("failed to link audioQueue2 to assetVolume: %v", err)
+	if err := audioQueue2.Link(assetAudioConvert); err != nil {
+		return nil, fmt.Errorf("failed to link audioQueue2 to assetAudioConvert: %v", err)
+	}
+	if err := assetAudioConvert.Link(assetAudioCapsfilter); err != nil {
+		return nil, fmt.Errorf("failed to link assetAudioConvert to assetAudioCapsfilter: %v", err)
+	}
+	if err := assetAudioCapsfilter.Link(assetVolume); err != nil {
+		return nil, fmt.Errorf("failed to link assetAudioCapsfilter to assetVolume: %v", err)
 	}
 	if err := assetVolume.Link(audiomixer); err != nil {
 		return nil, fmt.Errorf("failed to link assetVolume to audiomixer: %v", err)
@@ -1162,7 +1211,7 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 					fmt.Printf("[%s] Failed to create audio convert: %v\n", pipelineID, err)
 					return
 				}
-				audioConvert.SetProperty("sync", false)
+				audioConvert.SetProperty("sync", true)
 
 				// Add audioConvert to pipeline
 				if err := gp.pipeline.Add(audioConvert); err != nil {
@@ -1181,7 +1230,7 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 					fmt.Printf("[%s] Failed to create audio resample: %v\n", pipelineID, err)
 					return
 				}
-				audioResample.SetProperty("sync", false)
+				audioResample.SetProperty("sync", true)
 				audioResample.SetProperty("quality", 10)
 
 				// Add audioResample to pipeline
@@ -1191,6 +1240,27 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 				}
 				if err := audioResample.SetState(gst.StatePlaying); err != nil {
 					fmt.Printf("[%s] Failed to set audioResample to PLAYING: %v\n", pipelineID, err)
+					return
+				}
+
+				// Create dynamic audio capsfilter for format negotiation
+				dynamicAudioCapsfilter, err := gst.NewElementWithProperties("capsfilter", map[string]interface{}{
+					"name": fmt.Sprintf("dynamicAudioCapsfilter_%s_%s", pipelineID, padName),
+				})
+				if err != nil {
+					fmt.Printf("[%s] Failed to create dynamic audio capsfilter: %v\n", pipelineID, err)
+					return
+				}
+				// Set flexible audio caps for dynamic formats
+				dynamicAudioCapsfilter.SetProperty("caps", gst.NewCapsFromString("audio/x-raw,format={S16LE,S32LE,F32LE},layout=interleaved,rate={44100,48000},channels={1,2}"))
+
+				// Add dynamicAudioCapsfilter to pipeline
+				if err := gp.pipeline.Add(dynamicAudioCapsfilter); err != nil {
+					fmt.Printf("[%s] Failed to add dynamicAudioCapsfilter to pipeline: %v\n", pipelineID, err)
+					return
+				}
+				if err := dynamicAudioCapsfilter.SetState(gst.StatePlaying); err != nil {
+					fmt.Printf("[%s] Failed to set dynamicAudioCapsfilter to PLAYING: %v\n", pipelineID, err)
 					return
 				}
 
@@ -1213,7 +1283,7 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 					return
 				}
 
-				// Link the audio chain
+				// Link the audio chain with format conversion
 				if pad.Link(audioDemuxQueue.GetStaticPad("sink")) != gst.PadLinkOK {
 					fmt.Printf("[%s] Failed to link audio pad to queue\n", pipelineID)
 					return
@@ -1238,11 +1308,17 @@ func NewHLSGStreamerPipeline(hlsUrl string, outputHost string, outputPort int, a
 				}
 				fmt.Printf("[%s] Successfully linked decoder to audioconvert\n", pipelineID)
 
-				if audioConvert.GetStaticPad("src").Link(audioResample.GetStaticPad("sink")) != gst.PadLinkOK {
-					fmt.Printf("[%s] Failed to link audioconvert to audioresample\n", pipelineID)
+				if audioConvert.GetStaticPad("src").Link(dynamicAudioCapsfilter.GetStaticPad("sink")) != gst.PadLinkOK {
+					fmt.Printf("[%s] Failed to link audioconvert to dynamic capsfilter\n", pipelineID)
 					return
 				}
-				fmt.Printf("[%s] Successfully linked audioconvert to audioresample\n", pipelineID)
+				fmt.Printf("[%s] Successfully linked audioconvert to dynamic capsfilter\n", pipelineID)
+
+				if dynamicAudioCapsfilter.GetStaticPad("src").Link(audioResample.GetStaticPad("sink")) != gst.PadLinkOK {
+					fmt.Printf("[%s] Failed to link dynamic capsfilter to audioresample\n", pipelineID)
+					return
+				}
+				fmt.Printf("[%s] Successfully linked dynamic capsfilter to audioresample\n", pipelineID)
 
 				if audioResample.GetStaticPad("src").Link(audioCapsfilter.GetStaticPad("sink")) != gst.PadLinkOK {
 					fmt.Printf("[%s] Failed to link audioresample to capsfilter\n", pipelineID)
